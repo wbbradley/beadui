@@ -167,17 +167,28 @@ impl AppConfig {
 #[derive(Clone)]
 struct SnapshotCache {
     get_issue_cache: HashMap<String, Issue>,
+    // Map from issue_id -> (source_directory, db_path)
+    issue_sources: HashMap<String, (String, Option<PathBuf>)>,
 }
 
 impl SnapshotCache {
     fn new() -> Self {
         Self {
             get_issue_cache: HashMap::new(),
+            issue_sources: HashMap::new(),
         }
     }
 
     fn clear(&mut self) {
         self.get_issue_cache.clear();
+        self.issue_sources.clear();
+    }
+
+    fn register_issue_source(&mut self, issue_id: &str, source_directory: &str, db_path: Option<PathBuf>) {
+        self.issue_sources.insert(
+            issue_id.to_string(),
+            (source_directory.to_string(), db_path)
+        );
     }
 
     fn get_issue(&mut self, id: &str) -> Result<Issue, String> {
@@ -186,8 +197,9 @@ impl SnapshotCache {
             return Ok(cached_issue.clone());
         }
 
-        // Cache miss - fetch from CLI
-        let issue = BdClient::get_issue_uncached(id)?;
+        // Cache miss - fetch from CLI using the registered source
+        let db_path = self.issue_sources.get(id).and_then(|(_, path)| path.clone());
+        let issue = BdClient::get_issue_uncached(id, db_path.as_ref())?;
 
         // Store in cache
         self.get_issue_cache.insert(id.to_string(), issue.clone());
@@ -274,11 +286,29 @@ impl BdClient {
         all_issues
     }
 
-    fn get_issue_uncached(id: &str) -> Result<Issue, String> {
-        let output = Command::new("bd")
-            .arg("show")
-            .arg(id)
-            .arg("--json")
+    fn get_issue_uncached(id: &str, db_path: Option<&PathBuf>) -> Result<Issue, String> {
+        let mut cmd = Command::new("bd");
+        cmd.arg("show").arg(id).arg("--json");
+
+        // Add --db flag if db_path is provided
+        if let Some(path) = db_path {
+            // Construct path to .beads/*.db file
+            let mut db_file = path.clone();
+            db_file.push(".beads");
+
+            // Find the .db file in .beads directory
+            if let Ok(entries) = fs::read_dir(&db_file) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.extension().and_then(|s| s.to_str()) == Some("db") {
+                        cmd.arg("--db").arg(&entry_path);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let output = cmd
             .output()
             .map_err(|e| format!("Failed to execute bd: {}", e))?;
 
@@ -359,6 +389,8 @@ struct BeadUiApp {
     dependents_map: HashMap<String, Vec<String>>,
     // Snapshot-based cache for BdClient calls
     snapshot_cache: SnapshotCache,
+    // Application configuration
+    config: AppConfig,
 }
 
 // Struct to hold pre-computed display values for an issue
@@ -392,6 +424,29 @@ impl Default for BeadUiApp {
             ColumnFilter::new_with_excluded(vec!["closed".to_string()]),
         );
 
+        // Load config from file
+        let mut config = AppConfig::load();
+
+        // Auto-add current working directory if not already present
+        if let Ok(cwd) = std::env::current_dir() {
+            let cwd_exists = config.directories.iter().any(|d| d.path == cwd);
+
+            if !cwd_exists {
+                // Add PWD to config as visible by default
+                config.directories.push(DirectoryConfig {
+                    path: cwd,
+                    visible: true,
+                    display_name: String::new(), // Will be computed later
+                });
+
+                // Compute display names for all directories
+                config.compute_display_names();
+
+                // Save the updated config
+                let _ = config.save();
+            }
+        }
+
         let mut app = Self {
             issues: Vec::new(),
             selected_index: None,
@@ -406,6 +461,7 @@ impl Default for BeadUiApp {
             column_filters,
             dependents_map: HashMap::new(),
             snapshot_cache: SnapshotCache::new(),
+            config,
         };
         app.refresh();
         app
@@ -556,18 +612,27 @@ impl BeadUiApp {
         // Clear the snapshot cache on refresh
         self.snapshot_cache.clear();
 
-        // For now, use None for db_path to maintain current behavior (auto-discovery)
-        // This will be updated in beadui-20 to use multi-directory config
-        match BdClient::list_issues(None, "") {
-            Ok(issues) => {
-                self.issues = issues;
-                self.compute_dependents_map();
-                self.error_message = None;
-            }
-            Err(e) => {
-                self.error_message = Some(format!("Failed to load issues: {}", e));
+        // Load issues from all visible directories
+        self.issues = BdClient::list_issues_from_all(&self.config.directories);
+
+        // Register all issue sources in the cache
+        for dir_config in &self.config.directories {
+            if dir_config.visible {
+                for issue in &self.issues {
+                    if issue.source_directory == dir_config.display_name
+                        || (dir_config.display_name.is_empty() && issue.source_directory == dir_config.path.file_name().and_then(|n| n.to_str()).unwrap_or("")) {
+                        self.snapshot_cache.register_issue_source(
+                            &issue.id,
+                            &issue.source_directory,
+                            Some(dir_config.path.clone())
+                        );
+                    }
+                }
             }
         }
+
+        self.compute_dependents_map();
+        self.error_message = None;
     }
 
     fn get_blockers_count(&mut self, issue_id: &str) -> usize {
@@ -715,7 +780,60 @@ impl BeadUiApp {
         filtered
     }
 
+    fn show_sidebar(&mut self, ctx: &egui::Context) {
+        let mut config_changed = false;
+
+        egui::SidePanel::left("directories_sidebar")
+            .resizable(true)
+            .default_width(200.0)
+            .show_animated(ctx, !self.config.sidebar_collapsed, |ui| {
+                ui.heading("Directories");
+                ui.separator();
+
+                // Show list of directories with checkboxes
+                for dir in &mut self.config.directories {
+                    let mut visible = dir.visible;
+                    if ui.checkbox(&mut visible, &dir.display_name).changed() {
+                        dir.visible = visible;
+                        config_changed = true;
+                    }
+                }
+
+                ui.separator();
+
+                // Collapse button at bottom
+                if ui.button("◀ Collapse").clicked() {
+                    self.config.sidebar_collapsed = true;
+                    config_changed = true;
+                }
+            });
+
+        // Show expand button when collapsed
+        if self.config.sidebar_collapsed {
+            egui::Window::new("expand_sidebar")
+                .title_bar(false)
+                .resizable(false)
+                .fixed_pos([0.0, 100.0])
+                .show(ctx, |ui| {
+                    if ui.button("▶").clicked() {
+                        self.config.sidebar_collapsed = false;
+                        config_changed = true;
+                    }
+                });
+        }
+
+        // Save config if anything changed
+        if config_changed {
+            let _ = self.config.save();
+            // Refresh to reload issues with new visibility settings
+            self.refresh();
+        }
+    }
+
     fn show_list_view(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Show sidebar first (so it's on the left)
+        self.show_sidebar(ctx);
+
         // Header panel
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
