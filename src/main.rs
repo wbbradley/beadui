@@ -444,6 +444,7 @@ struct BeadUiApp {
     create_type: String,
     create_priority: i32,
     create_assignee: String,
+    create_directory_index: usize, // Index into config.directories for the selected directory
 }
 
 // Struct to hold pre-computed display values for an issue
@@ -500,6 +501,13 @@ impl Default for BeadUiApp {
             }
         }
 
+        // Find the first visible directory index for default creation
+        let first_visible_idx = config
+            .directories
+            .iter()
+            .position(|d| d.visible)
+            .unwrap_or(0);
+
         let mut app = Self {
             issues: Vec::new(),
             selected_index: None,
@@ -521,6 +529,7 @@ impl Default for BeadUiApp {
             create_type: "task".to_string(),
             create_priority: 2,
             create_assignee: String::new(),
+            create_directory_index: first_visible_idx,
         };
         app.refresh();
         app
@@ -960,6 +969,9 @@ impl BeadUiApp {
 
         // Header panel
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            // Add extra vertical spacing for better visual padding
+            ui.add_space(2.0);
+
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Beads Issue Tracker").strong());
                 ui.separator();
@@ -981,6 +993,9 @@ impl BeadUiApp {
             if let Some(ref error) = self.error_message {
                 ui.colored_label(egui::Color32::RED, error);
             }
+
+            // Add extra vertical spacing at bottom for symmetry
+            ui.add_space(2.0);
         });
 
         let mut new_sort_by = None;
@@ -1000,16 +1015,25 @@ impl BeadUiApp {
                     .max(min_panel_height)
                     .min(available_height - min_panel_height);
 
-                // List panel
+                // Separator/divider (draggable)
+                let separator_height = 12.0;
+
+                // List panel - clip it to end before the separator
                 let list_rect = egui::Rect::from_min_size(
                     ui.cursor().min,
                     egui::vec2(ui.available_width(), list_height),
+                );
+                // Create a tighter clip rect that stops before the separator
+                let list_clip_rect = egui::Rect::from_min_size(
+                    ui.cursor().min,
+                    egui::vec2(ui.available_width(), list_height - separator_height),
                 );
                 let mut list_ui = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(list_rect)
                         .layout(egui::Layout::top_down(egui::Align::LEFT)),
                 );
+                list_ui.set_clip_rect(list_clip_rect);
 
                 self.show_list_table(
                     &mut list_ui,
@@ -1018,9 +1042,6 @@ impl BeadUiApp {
                     &mut new_hovered_row,
                     &mut filter_toggle,
                 );
-
-                // Separator/divider (draggable)
-                let separator_height = 12.0;
                 let separator_rect = egui::Rect::from_min_size(
                     egui::pos2(list_rect.min.x, list_rect.max.y),
                     egui::vec2(ui.available_width(), separator_height),
@@ -1075,6 +1096,7 @@ impl BeadUiApp {
                         .max_rect(detail_rect)
                         .layout(egui::Layout::top_down(egui::Align::LEFT)),
                 );
+                detail_ui.set_clip_rect(detail_rect);
 
                 if let Some(idx) = self.selected_index {
                     if let Some(issue) = self.issues.get(idx) {
@@ -1165,6 +1187,10 @@ impl BeadUiApp {
         let blockers_cardinality = self.get_column_cardinality(SortColumn::Blockers);
         let dependents_cardinality = self.get_column_cardinality(SortColumn::Dependents);
 
+        // Wrap table in ScrollArea to ensure proper clipping at boundaries
+        egui::ScrollArea::vertical()
+            .id_salt("list_table_scroll")
+            .show(ui, |ui| {
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
@@ -1760,6 +1786,7 @@ impl BeadUiApp {
                     }
                 });
             });
+        }); // Close ScrollArea
     }
 
     fn sortable_header_ui(
@@ -1875,6 +1902,9 @@ impl BeadUiApp {
         let mut should_save = false;
         let mut should_refresh = false;
         let mut nav_to_issue_idx = None;
+
+        // Add spacing at top to prevent overdraw with list panel
+        ui.add_space(4.0);
 
         // Header
         ui.horizontal(|ui| {
@@ -2184,6 +2214,27 @@ impl BeadUiApp {
                         );
                     });
 
+                    ui.horizontal(|ui| {
+                        ui.label("Directory:");
+                        let selected_dir_name = self
+                            .config
+                            .directories
+                            .get(self.create_directory_index)
+                            .map(|d| d.display_name.as_str())
+                            .unwrap_or("(none)");
+                        egui::ComboBox::from_id_salt("create_directory_combo")
+                            .selected_text(selected_dir_name)
+                            .show_ui(ui, |ui| {
+                                for (idx, dir) in self.config.directories.iter().enumerate() {
+                                    ui.selectable_value(
+                                        &mut self.create_directory_index,
+                                        idx,
+                                        &dir.display_name,
+                                    );
+                                }
+                            });
+                    });
+
                     ui.separator();
 
                     ui.horizontal(|ui| {
@@ -2202,12 +2253,11 @@ impl BeadUiApp {
             if self.create_title.is_empty() {
                 self.error_message = Some("Title is required".to_string());
             } else {
-                // Get the db_path for the first visible directory
+                // Get the db_path for the selected directory
                 let db_path = self
                     .config
                     .directories
-                    .iter()
-                    .find(|d| d.visible)
+                    .get(self.create_directory_index)
                     .map(|d| d.path.clone());
 
                 let assignee = if self.create_assignee.is_empty() {
@@ -2231,6 +2281,13 @@ impl BeadUiApp {
                         self.create_type = "task".to_string();
                         self.create_priority = 2;
                         self.create_assignee.clear();
+                        // Reset to first visible directory
+                        self.create_directory_index = self
+                            .config
+                            .directories
+                            .iter()
+                            .position(|d| d.visible)
+                            .unwrap_or(0);
                         self.show_create_dialog = false;
                         self.error_message = None;
                         // Refresh the list
@@ -2251,6 +2308,13 @@ impl BeadUiApp {
             self.create_type = "task".to_string();
             self.create_priority = 2;
             self.create_assignee.clear();
+            // Reset to first visible directory
+            self.create_directory_index = self
+                .config
+                .directories
+                .iter()
+                .position(|d| d.visible)
+                .unwrap_or(0);
         }
     }
 }
