@@ -1,13 +1,14 @@
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
+use font_kit::{family_name::FamilyName, properties::Properties, source::SystemSource};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
-use font_kit::family_name::FamilyName;
-use font_kit::properties::Properties;
-use font_kit::source::SystemSource;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Issue {
@@ -39,21 +40,12 @@ struct DirectoryConfig {
 }
 
 // Application configuration persisted to ~/.config/beadui/config.yaml
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AppConfig {
     #[serde(default)]
     directories: Vec<DirectoryConfig>,
     #[serde(default)]
     sidebar_collapsed: bool,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            directories: Vec::new(),
-            sidebar_collapsed: false,
-        }
-    }
 }
 
 impl AppConfig {
@@ -81,15 +73,7 @@ impl AppConfig {
 
         // Try to read and parse the file
         match fs::read_to_string(&config_path) {
-            Ok(contents) => {
-                match serde_yaml::from_str::<AppConfig>(&contents) {
-                    Ok(config) => config,
-                    Err(_) => {
-                        // Corrupt file - return default
-                        Self::default()
-                    }
-                }
-            }
+            Ok(contents) => serde_yaml::from_str::<AppConfig>(&contents).unwrap_or_default(),
             Err(_) => Self::default(),
         }
     }
@@ -111,14 +95,14 @@ impl AppConfig {
             .map_err(|e| format!("Failed to serialize config: {}", e))?;
 
         // Write to file
-        fs::write(&config_path, yaml)
-            .map_err(|e| format!("Failed to write config file: {}", e))?;
+        fs::write(&config_path, yaml).map_err(|e| format!("Failed to write config file: {}", e))?;
 
         Ok(())
     }
 
     /// Abbreviate path by replacing home directory with ~
-    fn abbreviate_path(path: &PathBuf) -> String {
+    fn abbreviate_path(path: impl AsRef<Path>) -> String {
+        let path = path.as_ref();
         if let Some(home_dir) = dirs::home_dir() {
             if let Ok(suffix) = path.strip_prefix(&home_dir) {
                 return format!("~/{}", suffix.display());
@@ -134,16 +118,14 @@ impl AppConfig {
         let mut base_name_groups: HashMap<String, Vec<usize>> = HashMap::new();
 
         for (idx, dir) in self.directories.iter().enumerate() {
-            let base_name = dir.path
+            let base_name = dir
+                .path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
 
-            base_name_groups
-                .entry(base_name)
-                .or_insert_with(Vec::new)
-                .push(idx);
+            base_name_groups.entry(base_name).or_default().push(idx);
         }
 
         // Set display names based on uniqueness
@@ -184,10 +166,15 @@ impl SnapshotCache {
         self.issue_sources.clear();
     }
 
-    fn register_issue_source(&mut self, issue_id: &str, source_directory: &str, db_path: Option<PathBuf>) {
+    fn register_issue_source(
+        &mut self,
+        issue_id: &str,
+        source_directory: &str,
+        db_path: Option<PathBuf>,
+    ) {
         self.issue_sources.insert(
             issue_id.to_string(),
-            (source_directory.to_string(), db_path)
+            (source_directory.to_string(), db_path),
         );
     }
 
@@ -198,7 +185,10 @@ impl SnapshotCache {
         }
 
         // Cache miss - fetch from CLI using the registered source
-        let db_path = self.issue_sources.get(id).and_then(|(_, path)| path.clone());
+        let db_path = self
+            .issue_sources
+            .get(id)
+            .and_then(|(_, path)| path.clone());
         let issue = BdClient::get_issue_uncached(id, db_path.as_ref())?;
 
         // Store in cache
@@ -211,7 +201,10 @@ impl SnapshotCache {
 struct BdClient;
 
 impl BdClient {
-    fn list_issues(db_path: Option<&PathBuf>, source_directory: &str) -> Result<Vec<Issue>, String> {
+    fn list_issues(
+        db_path: Option<&PathBuf>,
+        source_directory: &str,
+    ) -> Result<Vec<Issue>, String> {
         let mut cmd = Command::new("bd");
         cmd.arg("list").arg("--json");
 
@@ -242,8 +235,8 @@ impl BdClient {
         }
 
         let json = String::from_utf8_lossy(&output.stdout);
-        let mut issues: Vec<Issue> = serde_json::from_str(&json)
-            .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+        let mut issues: Vec<Issue> =
+            serde_json::from_str(&json).map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
         // Set source_directory on all issues
         for issue in &mut issues {
@@ -263,7 +256,8 @@ impl BdClient {
 
             // Use display_name as source_directory identifier
             let source_name = if dir_config.display_name.is_empty() {
-                dir_config.path
+                dir_config
+                    .path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("")
@@ -344,12 +338,6 @@ struct ColumnFilter {
 }
 
 impl ColumnFilter {
-    fn new() -> Self {
-        Self {
-            excluded_values: HashSet::new(),
-        }
-    }
-
     fn new_with_excluded(excluded: Vec<String>) -> Self {
         Self {
             excluded_values: excluded.into_iter().collect(),
@@ -383,7 +371,7 @@ struct BeadUiApp {
     current_issue: Option<Issue>,
     edit_modified: bool,
     hovered_row: Option<usize>,
-    split_ratio: f32,  // Ratio of list height to total height (0.0 to 1.0)
+    split_ratio: f32, // Ratio of list height to total height (0.0 to 1.0)
     column_filters: HashMap<SortColumn, ColumnFilter>,
     // Map from issue_id -> list of issue_ids that depend on it
     dependents_map: HashMap<String, Vec<String>>,
@@ -457,7 +445,7 @@ impl Default for BeadUiApp {
             current_issue: None,
             edit_modified: false,
             hovered_row: None,
-            split_ratio: 0.5,  // Start with 50/50 split
+            split_ratio: 0.5, // Start with 50/50 split
             column_filters,
             dependents_map: HashMap::new(),
             snapshot_cache: SnapshotCache::new(),
@@ -484,37 +472,33 @@ impl BeadUiApp {
         // Try to find the system UI font based on platform
         let ui_font_result = if cfg!(target_os = "macos") {
             // On macOS, try system UI font (which will be San Francisco on modern macOS)
-            system_source.select_best_match(
-                &[FamilyName::SansSerif],
-                &Properties::new()
-            )
+            system_source.select_best_match(&[FamilyName::SansSerif], &Properties::new())
         } else if cfg!(target_os = "windows") {
             // On Windows, try Segoe UI
-            system_source.select_best_match(
-                &[FamilyName::Title("Segoe UI".to_string())],
-                &Properties::new()
-            ).or_else(|_| {
-                system_source.select_best_match(
-                    &[FamilyName::SansSerif],
-                    &Properties::new()
+            system_source
+                .select_best_match(
+                    &[FamilyName::Title("Segoe UI".to_string())],
+                    &Properties::new(),
                 )
-            })
+                .or_else(|_| {
+                    system_source.select_best_match(&[FamilyName::SansSerif], &Properties::new())
+                })
         } else {
             // On Linux, try common UI fonts
-            system_source.select_best_match(
-                &[FamilyName::Title("Ubuntu".to_string())],
-                &Properties::new()
-            ).or_else(|_| {
-                system_source.select_best_match(
-                    &[FamilyName::Title("Cantarell".to_string())],
-                    &Properties::new()
+            system_source
+                .select_best_match(
+                    &[FamilyName::Title("Ubuntu".to_string())],
+                    &Properties::new(),
                 )
-            }).or_else(|_| {
-                system_source.select_best_match(
-                    &[FamilyName::SansSerif],
-                    &Properties::new()
-                )
-            })
+                .or_else(|_| {
+                    system_source.select_best_match(
+                        &[FamilyName::Title("Cantarell".to_string())],
+                        &Properties::new(),
+                    )
+                })
+                .or_else(|_| {
+                    system_source.select_best_match(&[FamilyName::SansSerif], &Properties::new())
+                })
         };
 
         // Load the system font if found
@@ -537,10 +521,8 @@ impl BeadUiApp {
         }
 
         // Load system monospace font
-        let mono_font_result = system_source.select_best_match(
-            &[FamilyName::Monospace],
-            &Properties::new()
-        );
+        let mono_font_result =
+            system_source.select_best_match(&[FamilyName::Monospace], &Properties::new());
 
         if let Ok(handle) = mono_font_result {
             if let Ok(font) = handle.load() {
@@ -572,11 +554,26 @@ impl BeadUiApp {
         // Configure text styles with appropriate sizes for a native look
         // These sizes work well on macOS and other platforms
         style.text_styles = [
-            (egui::TextStyle::Small, egui::FontId::new(11.0, egui::FontFamily::Proportional)),
-            (egui::TextStyle::Body, egui::FontId::new(13.0, egui::FontFamily::Proportional)),
-            (egui::TextStyle::Button, egui::FontId::new(13.0, egui::FontFamily::Proportional)),
-            (egui::TextStyle::Heading, egui::FontId::new(17.0, egui::FontFamily::Proportional)),
-            (egui::TextStyle::Monospace, egui::FontId::new(12.0, egui::FontFamily::Monospace)),
+            (
+                egui::TextStyle::Small,
+                egui::FontId::new(11.0, egui::FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Body,
+                egui::FontId::new(13.0, egui::FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Button,
+                egui::FontId::new(13.0, egui::FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Heading,
+                egui::FontId::new(17.0, egui::FontFamily::Proportional),
+            ),
+            (
+                egui::TextStyle::Monospace,
+                egui::FontId::new(12.0, egui::FontFamily::Monospace),
+            ),
         ]
         .into();
 
@@ -599,7 +596,7 @@ impl BeadUiApp {
                 for dep in &full_issue.dependencies {
                     dependents_map
                         .entry(dep.id.clone())
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(issue.id.clone());
                 }
             }
@@ -620,11 +617,18 @@ impl BeadUiApp {
             if dir_config.visible {
                 for issue in &self.issues {
                     if issue.source_directory == dir_config.display_name
-                        || (dir_config.display_name.is_empty() && issue.source_directory == dir_config.path.file_name().and_then(|n| n.to_str()).unwrap_or("")) {
+                        || (dir_config.display_name.is_empty()
+                            && issue.source_directory
+                                == dir_config
+                                    .path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(""))
+                    {
                         self.snapshot_cache.register_issue_source(
                             &issue.id,
                             &issue.source_directory,
-                            Some(dir_config.path.clone())
+                            Some(dir_config.path.clone()),
                         );
                     }
                 }
@@ -638,7 +642,9 @@ impl BeadUiApp {
     fn get_blockers_count(&mut self, issue_id: &str) -> usize {
         // Get full issue to count active blockers (dependencies that are not closed)
         if let Ok(full_issue) = self.snapshot_cache.get_issue(issue_id) {
-            full_issue.dependencies.iter()
+            full_issue
+                .dependencies
+                .iter()
                 .filter(|dep| dep.status != "closed")
                 .count()
         } else {
@@ -647,7 +653,10 @@ impl BeadUiApp {
     }
 
     fn get_dependents_count(&self, issue_id: &str) -> usize {
-        self.dependents_map.get(issue_id).map(|v| v.len()).unwrap_or(0)
+        self.dependents_map
+            .get(issue_id)
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
     fn get_readiness(&mut self, issue: &Issue) -> String {
@@ -734,7 +743,9 @@ impl BeadUiApp {
                         SortColumn::Status => readiness.clone(),
                         SortColumn::Priority => format!("P{}", issue.priority),
                         SortColumn::Type => issue.issue_type.clone(),
-                        SortColumn::Assignee => issue.assignee.clone().unwrap_or_else(|| "-".to_string()),
+                        SortColumn::Assignee => {
+                            issue.assignee.clone().unwrap_or_else(|| "-".to_string())
+                        }
                         SortColumn::Blockers => blockers_count.to_string(),
                         SortColumn::Dependents => dependents_count.to_string(),
                     };
@@ -782,6 +793,7 @@ impl BeadUiApp {
 
     fn show_sidebar(&mut self, ctx: &egui::Context) {
         let mut config_changed = false;
+        let mut add_directory_clicked = false;
 
         egui::SidePanel::left("directories_sidebar")
             .resizable(true)
@@ -797,6 +809,13 @@ impl BeadUiApp {
                         dir.visible = visible;
                         config_changed = true;
                     }
+                }
+
+                ui.separator();
+
+                // Add directory button
+                if ui.button("+ Add Directory").clicked() {
+                    add_directory_clicked = true;
                 }
 
                 ui.separator();
@@ -820,6 +839,40 @@ impl BeadUiApp {
                         config_changed = true;
                     }
                 });
+        }
+
+        // Handle add directory button click
+        if add_directory_clicked {
+            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                // Validate that the directory contains .beads/ subdirectory
+                let mut beads_path = folder.clone();
+                beads_path.push(".beads");
+
+                if beads_path.exists() && beads_path.is_dir() {
+                    // Check if this directory is not already in the config
+                    let already_exists = self.config.directories.iter().any(|d| d.path == folder);
+
+                    if !already_exists {
+                        // Add the directory to config
+                        self.config.directories.push(DirectoryConfig {
+                            path: folder,
+                            visible: true,
+                            display_name: String::new(), // Will be computed
+                        });
+
+                        // Compute display names
+                        self.config.compute_display_names();
+
+                        config_changed = true;
+                    } else {
+                        self.error_message = Some("Directory already added".to_string());
+                    }
+                } else {
+                    self.error_message = Some(
+                        "Selected directory does not contain a .beads/ subdirectory".to_string(),
+                    );
+                }
+            }
         }
 
         // Save config if anything changed
@@ -875,39 +928,47 @@ impl BeadUiApp {
                 // List panel
                 let list_rect = egui::Rect::from_min_size(
                     ui.cursor().min,
-                    egui::vec2(ui.available_width(), list_height)
+                    egui::vec2(ui.available_width(), list_height),
                 );
                 let mut list_ui = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(list_rect)
-                        .layout(egui::Layout::top_down(egui::Align::LEFT))
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
                 );
 
-                self.show_list_table(&mut list_ui, &mut new_sort_by, &mut new_selected, &mut new_hovered_row, &mut filter_toggle);
+                self.show_list_table(
+                    &mut list_ui,
+                    &mut new_sort_by,
+                    &mut new_selected,
+                    &mut new_hovered_row,
+                    &mut filter_toggle,
+                );
 
                 // Separator/divider (draggable)
                 let separator_height = 12.0;
                 let separator_rect = egui::Rect::from_min_size(
                     egui::pos2(list_rect.min.x, list_rect.max.y),
-                    egui::vec2(ui.available_width(), separator_height)
+                    egui::vec2(ui.available_width(), separator_height),
                 );
 
                 let separator_id = ui.id().with("split_separator");
-                let separator_response = ui.interact(separator_rect, separator_id, egui::Sense::drag());
+                let separator_response =
+                    ui.interact(separator_rect, separator_id, egui::Sense::drag());
 
                 // Draw separator with vertical padding
-                let separator_color = if separator_response.hovered() || separator_response.dragged() {
-                    ui.visuals().widgets.active.bg_fill
-                } else {
-                    ui.visuals().widgets.inactive.bg_fill
-                };
+                let separator_color =
+                    if separator_response.hovered() || separator_response.dragged() {
+                        ui.visuals().widgets.active.bg_fill
+                    } else {
+                        ui.visuals().widgets.inactive.bg_fill
+                    };
                 let top_padding = 2.0;
                 let _bottom_padding = 6.0;
                 let visual_height = 3.0; // Thin visible line
 
                 let visual_rect = egui::Rect::from_min_size(
                     egui::pos2(separator_rect.min.x, separator_rect.min.y + top_padding),
-                    egui::vec2(separator_rect.width(), visual_height)
+                    egui::vec2(separator_rect.width(), visual_height),
                 );
                 ui.painter().rect_filled(visual_rect, 0.0, separator_color);
 
@@ -929,12 +990,15 @@ impl BeadUiApp {
                 // Detail panel
                 let detail_rect = egui::Rect::from_min_size(
                     egui::pos2(list_rect.min.x, separator_rect.max.y),
-                    egui::vec2(ui.available_width(), available_height - list_height - separator_height)
+                    egui::vec2(
+                        ui.available_width(),
+                        available_height - list_height - separator_height,
+                    ),
                 );
                 let mut detail_ui = ui.new_child(
                     egui::UiBuilder::new()
                         .max_rect(detail_rect)
-                        .layout(egui::Layout::top_down(egui::Align::LEFT))
+                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
                 );
 
                 if let Some(idx) = self.selected_index {
@@ -945,7 +1009,13 @@ impl BeadUiApp {
                 }
             } else {
                 // No issue selected - show list only
-                self.show_list_table(ui, &mut new_sort_by, &mut new_selected, &mut new_hovered_row, &mut filter_toggle);
+                self.show_list_table(
+                    ui,
+                    &mut new_sort_by,
+                    &mut new_selected,
+                    &mut new_hovered_row,
+                    &mut filter_toggle,
+                );
             }
         });
 
@@ -973,7 +1043,7 @@ impl BeadUiApp {
         if let Some((column, value)) = filter_toggle {
             self.column_filters
                 .entry(column)
-                .or_insert_with(ColumnFilter::new)
+                .or_default()
                 .toggle_exclude(value);
         }
 
@@ -1024,58 +1094,112 @@ impl BeadUiApp {
             .striped(true)
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::initial(100.0).resizable(true))  // ID
-            .column(Column::initial(120.0).resizable(true))  // Directory
-            .column(Column::remainder().resizable(true))      // Title
-            .column(Column::initial(100.0).resizable(true))  // Status
-            .column(Column::initial(70.0).resizable(true))   // Priority
-            .column(Column::initial(100.0).resizable(true))  // Type
-            .column(Column::initial(120.0).resizable(true))  // Assignee
-            .column(Column::initial(80.0).resizable(true))   // Blockers
-            .column(Column::initial(80.0).resizable(true))   // Dependents
+            .column(Column::initial(100.0).resizable(true)) // ID
+            .column(Column::initial(120.0).resizable(true)) // Directory
+            .column(Column::remainder().resizable(true)) // Title
+            .column(Column::initial(100.0).resizable(true)) // Status
+            .column(Column::initial(70.0).resizable(true)) // Priority
+            .column(Column::initial(100.0).resizable(true)) // Type
+            .column(Column::initial(120.0).resizable(true)) // Assignee
+            .column(Column::initial(80.0).resizable(true)) // Blockers
+            .column(Column::initial(80.0).resizable(true)) // Dependents
             .header(25.0, |mut header| {
                 header.col(|ui| {
-                    if self.sortable_header_ui(ui, "ID", SortColumn::Id, id_cardinality, filter_toggle) {
+                    if self.sortable_header_ui(
+                        ui,
+                        "ID",
+                        SortColumn::Id,
+                        id_cardinality,
+                        filter_toggle,
+                    ) {
                         *new_sort_by = Some(SortColumn::Id);
                     }
                 });
                 header.col(|ui| {
-                    if self.sortable_header_ui(ui, "Directory", SortColumn::Directory, directory_cardinality, filter_toggle) {
+                    if self.sortable_header_ui(
+                        ui,
+                        "Directory",
+                        SortColumn::Directory,
+                        directory_cardinality,
+                        filter_toggle,
+                    ) {
                         *new_sort_by = Some(SortColumn::Directory);
                     }
                 });
                 header.col(|ui| {
-                    if self.sortable_header_ui(ui, "Title", SortColumn::Title, title_cardinality, filter_toggle) {
+                    if self.sortable_header_ui(
+                        ui,
+                        "Title",
+                        SortColumn::Title,
+                        title_cardinality,
+                        filter_toggle,
+                    ) {
                         *new_sort_by = Some(SortColumn::Title);
                     }
                 });
                 header.col(|ui| {
-                    if self.sortable_header_ui(ui, "Status", SortColumn::Status, status_cardinality, filter_toggle) {
+                    if self.sortable_header_ui(
+                        ui,
+                        "Status",
+                        SortColumn::Status,
+                        status_cardinality,
+                        filter_toggle,
+                    ) {
                         *new_sort_by = Some(SortColumn::Status);
                     }
                 });
                 header.col(|ui| {
-                    if self.sortable_header_ui(ui, "Priority", SortColumn::Priority, priority_cardinality, filter_toggle) {
+                    if self.sortable_header_ui(
+                        ui,
+                        "Priority",
+                        SortColumn::Priority,
+                        priority_cardinality,
+                        filter_toggle,
+                    ) {
                         *new_sort_by = Some(SortColumn::Priority);
                     }
                 });
                 header.col(|ui| {
-                    if self.sortable_header_ui(ui, "Type", SortColumn::Type, type_cardinality, filter_toggle) {
+                    if self.sortable_header_ui(
+                        ui,
+                        "Type",
+                        SortColumn::Type,
+                        type_cardinality,
+                        filter_toggle,
+                    ) {
                         *new_sort_by = Some(SortColumn::Type);
                     }
                 });
                 header.col(|ui| {
-                    if self.sortable_header_ui(ui, "Assignee", SortColumn::Assignee, assignee_cardinality, filter_toggle) {
+                    if self.sortable_header_ui(
+                        ui,
+                        "Assignee",
+                        SortColumn::Assignee,
+                        assignee_cardinality,
+                        filter_toggle,
+                    ) {
                         *new_sort_by = Some(SortColumn::Assignee);
                     }
                 });
                 header.col(|ui| {
-                    if self.sortable_header_ui(ui, "Blockers", SortColumn::Blockers, blockers_cardinality, filter_toggle) {
+                    if self.sortable_header_ui(
+                        ui,
+                        "Blockers",
+                        SortColumn::Blockers,
+                        blockers_cardinality,
+                        filter_toggle,
+                    ) {
                         *new_sort_by = Some(SortColumn::Blockers);
                     }
                 });
                 header.col(|ui| {
-                    if self.sortable_header_ui(ui, "Dependents", SortColumn::Dependents, dependents_cardinality, filter_toggle) {
+                    if self.sortable_header_ui(
+                        ui,
+                        "Dependents",
+                        SortColumn::Dependents,
+                        dependents_cardinality,
+                        filter_toggle,
+                    ) {
                         *new_sort_by = Some(SortColumn::Dependents);
                     }
                 });
@@ -1103,13 +1227,17 @@ impl BeadUiApp {
                             }
 
                             if is_row_hovered {
-                                ui.painter().rect_filled(rect, 0.0, ui.visuals().widgets.hovered.bg_fill);
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    ui.visuals().widgets.hovered.bg_fill,
+                                );
                             }
 
                             let mut child_ui = ui.new_child(
                                 egui::UiBuilder::new()
                                     .max_rect(rect)
-                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
                             child_ui.add(egui::Label::new(&issue.id).selectable(false));
 
@@ -1133,15 +1261,20 @@ impl BeadUiApp {
                             }
 
                             if is_row_hovered {
-                                ui.painter().rect_filled(rect, 0.0, ui.visuals().widgets.hovered.bg_fill);
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    ui.visuals().widgets.hovered.bg_fill,
+                                );
                             }
 
                             let mut child_ui = ui.new_child(
                                 egui::UiBuilder::new()
                                     .max_rect(rect)
-                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
-                            child_ui.add(egui::Label::new(&issue.source_directory).selectable(false));
+                            child_ui
+                                .add(egui::Label::new(&issue.source_directory).selectable(false));
 
                             if response.clicked() {
                                 *new_selected = Some(Some(original_idx));
@@ -1153,20 +1286,28 @@ impl BeadUiApp {
                             let directory_value = issue.source_directory.clone();
                             response.context_menu(|ui| {
                                 if directory_cardinality > 20 {
-                                    ui.label(format!("⚠ High cardinality ({} values)", directory_cardinality));
+                                    ui.label(format!(
+                                        "⚠ High cardinality ({} values)",
+                                        directory_cardinality
+                                    ));
                                     ui.label("Filtering not available");
                                 } else {
-                                    let current_filter = self.column_filters.get(&SortColumn::Directory);
+                                    let current_filter =
+                                        self.column_filters.get(&SortColumn::Directory);
                                     let is_filtered = current_filter
                                         .map(|f| f.is_filtered(&directory_value))
                                         .unwrap_or(false);
 
-                                    if ui.button(if is_filtered {
-                                        format!("✓ Include \"{}\"", directory_value)
-                                    } else {
-                                        format!("✗ Exclude \"{}\"", directory_value)
-                                    }).clicked() {
-                                        *filter_toggle = Some((SortColumn::Directory, directory_value.clone()));
+                                    if ui
+                                        .button(if is_filtered {
+                                            format!("✓ Include \"{}\"", directory_value)
+                                        } else {
+                                            format!("✗ Exclude \"{}\"", directory_value)
+                                        })
+                                        .clicked()
+                                    {
+                                        *filter_toggle =
+                                            Some((SortColumn::Directory, directory_value.clone()));
                                         ui.close_menu();
                                     }
                                 }
@@ -1183,13 +1324,17 @@ impl BeadUiApp {
                             }
 
                             if is_row_hovered {
-                                ui.painter().rect_filled(rect, 0.0, ui.visuals().widgets.hovered.bg_fill);
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    ui.visuals().widgets.hovered.bg_fill,
+                                );
                             }
 
                             let mut child_ui = ui.new_child(
                                 egui::UiBuilder::new()
                                     .max_rect(rect)
-                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
                             child_ui.add(egui::Label::new(&issue.title).selectable(false));
 
@@ -1212,13 +1357,17 @@ impl BeadUiApp {
                             }
 
                             if is_row_hovered {
-                                ui.painter().rect_filled(rect, 0.0, ui.visuals().widgets.hovered.bg_fill);
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    ui.visuals().widgets.hovered.bg_fill,
+                                );
                             }
 
                             let mut child_ui = ui.new_child(
                                 egui::UiBuilder::new()
                                     .max_rect(rect)
-                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
                             let status_text = &display.readiness;
                             child_ui.add(egui::Label::new(status_text).selectable(false));
@@ -1233,20 +1382,28 @@ impl BeadUiApp {
                             let status_value = status_text.clone();
                             response.context_menu(|ui| {
                                 if status_cardinality > 20 {
-                                    ui.label(format!("⚠ High cardinality ({} values)", status_cardinality));
+                                    ui.label(format!(
+                                        "⚠ High cardinality ({} values)",
+                                        status_cardinality
+                                    ));
                                     ui.label("Filtering not available");
                                 } else {
-                                    let current_filter = self.column_filters.get(&SortColumn::Status);
+                                    let current_filter =
+                                        self.column_filters.get(&SortColumn::Status);
                                     let is_filtered = current_filter
                                         .map(|f| f.is_filtered(&status_value))
                                         .unwrap_or(false);
 
-                                    if ui.button(if is_filtered {
-                                        format!("✓ Include \"{}\"", status_value)
-                                    } else {
-                                        format!("✗ Exclude \"{}\"", status_value)
-                                    }).clicked() {
-                                        *filter_toggle = Some((SortColumn::Status, status_value.clone()));
+                                    if ui
+                                        .button(if is_filtered {
+                                            format!("✓ Include \"{}\"", status_value)
+                                        } else {
+                                            format!("✗ Exclude \"{}\"", status_value)
+                                        })
+                                        .clicked()
+                                    {
+                                        *filter_toggle =
+                                            Some((SortColumn::Status, status_value.clone()));
                                         ui.close_menu();
                                     }
                                 }
@@ -1263,13 +1420,17 @@ impl BeadUiApp {
                             }
 
                             if is_row_hovered {
-                                ui.painter().rect_filled(rect, 0.0, ui.visuals().widgets.hovered.bg_fill);
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    ui.visuals().widgets.hovered.bg_fill,
+                                );
                             }
 
                             let mut child_ui = ui.new_child(
                                 egui::UiBuilder::new()
                                     .max_rect(rect)
-                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
                             let priority_text = format!("P{}", issue.priority);
                             child_ui.add(egui::Label::new(&priority_text).selectable(false));
@@ -1284,20 +1445,28 @@ impl BeadUiApp {
                             let priority_value = priority_text.clone();
                             response.context_menu(|ui| {
                                 if priority_cardinality > 20 {
-                                    ui.label(format!("⚠ High cardinality ({} values)", priority_cardinality));
+                                    ui.label(format!(
+                                        "⚠ High cardinality ({} values)",
+                                        priority_cardinality
+                                    ));
                                     ui.label("Filtering not available");
                                 } else {
-                                    let current_filter = self.column_filters.get(&SortColumn::Priority);
+                                    let current_filter =
+                                        self.column_filters.get(&SortColumn::Priority);
                                     let is_filtered = current_filter
                                         .map(|f| f.is_filtered(&priority_value))
                                         .unwrap_or(false);
 
-                                    if ui.button(if is_filtered {
-                                        format!("✓ Include \"{}\"", priority_value)
-                                    } else {
-                                        format!("✗ Exclude \"{}\"", priority_value)
-                                    }).clicked() {
-                                        *filter_toggle = Some((SortColumn::Priority, priority_value.clone()));
+                                    if ui
+                                        .button(if is_filtered {
+                                            format!("✓ Include \"{}\"", priority_value)
+                                        } else {
+                                            format!("✗ Exclude \"{}\"", priority_value)
+                                        })
+                                        .clicked()
+                                    {
+                                        *filter_toggle =
+                                            Some((SortColumn::Priority, priority_value.clone()));
                                         ui.close_menu();
                                     }
                                 }
@@ -1314,13 +1483,17 @@ impl BeadUiApp {
                             }
 
                             if is_row_hovered {
-                                ui.painter().rect_filled(rect, 0.0, ui.visuals().widgets.hovered.bg_fill);
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    ui.visuals().widgets.hovered.bg_fill,
+                                );
                             }
 
                             let mut child_ui = ui.new_child(
                                 egui::UiBuilder::new()
                                     .max_rect(rect)
-                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
                             child_ui.add(egui::Label::new(&issue.issue_type).selectable(false));
 
@@ -1334,7 +1507,10 @@ impl BeadUiApp {
                             let type_value = issue.issue_type.clone();
                             response.context_menu(|ui| {
                                 if type_cardinality > 20 {
-                                    ui.label(format!("⚠ High cardinality ({} values)", type_cardinality));
+                                    ui.label(format!(
+                                        "⚠ High cardinality ({} values)",
+                                        type_cardinality
+                                    ));
                                     ui.label("Filtering not available");
                                 } else {
                                     let current_filter = self.column_filters.get(&SortColumn::Type);
@@ -1342,12 +1518,16 @@ impl BeadUiApp {
                                         .map(|f| f.is_filtered(&type_value))
                                         .unwrap_or(false);
 
-                                    if ui.button(if is_filtered {
-                                        format!("✓ Include \"{}\"", type_value)
-                                    } else {
-                                        format!("✗ Exclude \"{}\"", type_value)
-                                    }).clicked() {
-                                        *filter_toggle = Some((SortColumn::Type, type_value.clone()));
+                                    if ui
+                                        .button(if is_filtered {
+                                            format!("✓ Include \"{}\"", type_value)
+                                        } else {
+                                            format!("✗ Exclude \"{}\"", type_value)
+                                        })
+                                        .clicked()
+                                    {
+                                        *filter_toggle =
+                                            Some((SortColumn::Type, type_value.clone()));
                                         ui.close_menu();
                                     }
                                 }
@@ -1364,15 +1544,20 @@ impl BeadUiApp {
                             }
 
                             if is_row_hovered {
-                                ui.painter().rect_filled(rect, 0.0, ui.visuals().widgets.hovered.bg_fill);
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    ui.visuals().widgets.hovered.bg_fill,
+                                );
                             }
 
                             let mut child_ui = ui.new_child(
                                 egui::UiBuilder::new()
                                     .max_rect(rect)
-                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
-                            let assignee_text = issue.assignee.as_ref().unwrap_or(&"-".to_string()).clone();
+                            let assignee_text =
+                                issue.assignee.as_ref().unwrap_or(&"-".to_string()).clone();
                             child_ui.add(egui::Label::new(&assignee_text).selectable(false));
 
                             if response.clicked() {
@@ -1385,20 +1570,28 @@ impl BeadUiApp {
                             let assignee_value = assignee_text.clone();
                             response.context_menu(|ui| {
                                 if assignee_cardinality > 20 {
-                                    ui.label(format!("⚠ High cardinality ({} values)", assignee_cardinality));
+                                    ui.label(format!(
+                                        "⚠ High cardinality ({} values)",
+                                        assignee_cardinality
+                                    ));
                                     ui.label("Filtering not available");
                                 } else {
-                                    let current_filter = self.column_filters.get(&SortColumn::Assignee);
+                                    let current_filter =
+                                        self.column_filters.get(&SortColumn::Assignee);
                                     let is_filtered = current_filter
                                         .map(|f| f.is_filtered(&assignee_value))
                                         .unwrap_or(false);
 
-                                    if ui.button(if is_filtered {
-                                        format!("✓ Include \"{}\"", assignee_value)
-                                    } else {
-                                        format!("✗ Exclude \"{}\"", assignee_value)
-                                    }).clicked() {
-                                        *filter_toggle = Some((SortColumn::Assignee, assignee_value.clone()));
+                                    if ui
+                                        .button(if is_filtered {
+                                            format!("✓ Include \"{}\"", assignee_value)
+                                        } else {
+                                            format!("✗ Exclude \"{}\"", assignee_value)
+                                        })
+                                        .clicked()
+                                    {
+                                        *filter_toggle =
+                                            Some((SortColumn::Assignee, assignee_value.clone()));
                                         ui.close_menu();
                                     }
                                 }
@@ -1416,16 +1609,22 @@ impl BeadUiApp {
                             }
 
                             if is_row_hovered {
-                                ui.painter().rect_filled(rect, 0.0, ui.visuals().widgets.hovered.bg_fill);
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    ui.visuals().widgets.hovered.bg_fill,
+                                );
                             }
 
                             let mut child_ui = ui.new_child(
                                 egui::UiBuilder::new()
                                     .max_rect(rect)
-                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
                             let blockers_count = display.blockers_count;
-                            child_ui.add(egui::Label::new(blockers_count.to_string()).selectable(false));
+                            child_ui.add(
+                                egui::Label::new(blockers_count.to_string()).selectable(false),
+                            );
 
                             if response.clicked() {
                                 *new_selected = Some(Some(original_idx));
@@ -1446,16 +1645,22 @@ impl BeadUiApp {
                             }
 
                             if is_row_hovered {
-                                ui.painter().rect_filled(rect, 0.0, ui.visuals().widgets.hovered.bg_fill);
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    ui.visuals().widgets.hovered.bg_fill,
+                                );
                             }
 
                             let mut child_ui = ui.new_child(
                                 egui::UiBuilder::new()
                                     .max_rect(rect)
-                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
                             let dependents_count = display.dependents_count;
-                            child_ui.add(egui::Label::new(dependents_count.to_string()).selectable(false));
+                            child_ui.add(
+                                egui::Label::new(dependents_count.to_string()).selectable(false),
+                            );
 
                             if response.clicked() {
                                 *new_selected = Some(Some(original_idx));
@@ -1518,7 +1723,9 @@ impl BeadUiApp {
                 Vec::new()
             };
 
-            let current_filter_excluded = self.column_filters.get(&column)
+            let current_filter_excluded = self
+                .column_filters
+                .get(&column)
                 .map(|f| f.excluded_values.clone())
                 .unwrap_or_default();
             let has_active_filters = !current_filter_excluded.is_empty();
@@ -1565,7 +1772,9 @@ impl BeadUiApp {
 
     fn show_detail_view_split(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui, issue_id: &str) {
         // Load issue if not already loaded or if different issue
-        if self.current_issue.is_none() || self.current_issue.as_ref().map(|i| &i.id) != Some(&issue_id.to_string()) {
+        if self.current_issue.is_none()
+            || self.current_issue.as_ref().map(|i| &i.id) != Some(&issue_id.to_string())
+        {
             match self.snapshot_cache.get_issue(issue_id) {
                 Ok(issue) => {
                     self.current_issue = Some(issue);
@@ -1609,145 +1818,161 @@ impl BeadUiApp {
         ui.separator();
 
         // Content
-        egui::ScrollArea::vertical().id_salt("detail_scroll").show(ui, |ui| {
-            if let Some(ref mut issue) = self.current_issue {
-                ui.horizontal(|ui| {
-                    ui.label("ID:");
-                    ui.label(&issue.id);
-                });
+        egui::ScrollArea::vertical()
+            .id_salt("detail_scroll")
+            .show(ui, |ui| {
+                if let Some(ref mut issue) = self.current_issue {
+                    ui.horizontal(|ui| {
+                        ui.label("ID:");
+                        ui.label(&issue.id);
+                    });
 
-                ui.horizontal(|ui| {
-                    ui.label("Title:");
-                    let title_edit = egui::TextEdit::singleline(&mut issue.title)
-                        .desired_width(f32::INFINITY);
-                    if ui.add(title_edit).changed() {
-                        self.edit_modified = true;
-                    }
-                });
+                    ui.horizontal(|ui| {
+                        ui.label("Title:");
+                        let title_edit = egui::TextEdit::singleline(&mut issue.title)
+                            .desired_width(f32::INFINITY);
+                        if ui.add(title_edit).changed() {
+                            self.edit_modified = true;
+                        }
+                    });
 
-                ui.horizontal(|ui| {
-                    ui.label("Status:");
-                    let old_status = issue.status.clone();
-                    egui::ComboBox::from_id_salt("status_combo")
-                        .selected_text(&issue.status)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut issue.status, "open".to_string(), "open");
-                            ui.selectable_value(&mut issue.status, "in_progress".to_string(), "in_progress");
-                            ui.selectable_value(&mut issue.status, "closed".to_string(), "closed");
-                        });
-                    if issue.status != old_status {
-                        self.edit_modified = true;
-                    }
-                });
+                    ui.horizontal(|ui| {
+                        ui.label("Status:");
+                        let old_status = issue.status.clone();
+                        egui::ComboBox::from_id_salt("status_combo")
+                            .selected_text(&issue.status)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut issue.status, "open".to_string(), "open");
+                                ui.selectable_value(
+                                    &mut issue.status,
+                                    "in_progress".to_string(),
+                                    "in_progress",
+                                );
+                                ui.selectable_value(
+                                    &mut issue.status,
+                                    "closed".to_string(),
+                                    "closed",
+                                );
+                            });
+                        if issue.status != old_status {
+                            self.edit_modified = true;
+                        }
+                    });
 
-                ui.horizontal(|ui| {
-                    ui.label("Priority:");
-                    let old_priority = issue.priority;
-                    egui::ComboBox::from_id_salt("priority_combo")
-                        .selected_text(format!("P{}", issue.priority))
-                        .show_ui(ui, |ui| {
-                            for p in 0..=4 {
-                                ui.selectable_value(&mut issue.priority, p, format!("P{}", p));
-                            }
-                        });
-                    if issue.priority != old_priority {
-                        self.edit_modified = true;
-                    }
-                });
+                    ui.horizontal(|ui| {
+                        ui.label("Priority:");
+                        let old_priority = issue.priority;
+                        egui::ComboBox::from_id_salt("priority_combo")
+                            .selected_text(format!("P{}", issue.priority))
+                            .show_ui(ui, |ui| {
+                                for p in 0..=4 {
+                                    ui.selectable_value(&mut issue.priority, p, format!("P{}", p));
+                                }
+                            });
+                        if issue.priority != old_priority {
+                            self.edit_modified = true;
+                        }
+                    });
 
-                ui.horizontal(|ui| {
-                    ui.label("Type:");
-                    ui.label(&issue.issue_type);
-                });
+                    ui.horizontal(|ui| {
+                        ui.label("Type:");
+                        ui.label(&issue.issue_type);
+                    });
 
-                ui.horizontal(|ui| {
-                    ui.label("Assignee:");
-                    let mut assignee_text = issue.assignee.clone().unwrap_or_default();
-                    let assignee_edit = egui::TextEdit::singleline(&mut assignee_text)
-                        .desired_width(f32::INFINITY);
-                    if ui.add(assignee_edit).changed() {
-                        issue.assignee = if assignee_text.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label("Assignee:");
+                        let mut assignee_text = issue.assignee.clone().unwrap_or_default();
+                        let assignee_edit = egui::TextEdit::singleline(&mut assignee_text)
+                            .desired_width(f32::INFINITY);
+                        if ui.add(assignee_edit).changed() {
+                            issue.assignee = if assignee_text.is_empty() {
+                                None
+                            } else {
+                                Some(assignee_text)
+                            };
+                            self.edit_modified = true;
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Created:");
+                        ui.label(&issue.created_at);
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Updated:");
+                        ui.label(&issue.updated_at);
+                    });
+
+                    ui.separator();
+                    ui.label("Description:");
+                    ui.label(&issue.description);
+
+                    ui.separator();
+                    ui.label("Notes:");
+                    let mut notes_text = issue.notes.clone().unwrap_or_default();
+                    let notes_edit = egui::TextEdit::multiline(&mut notes_text)
+                        .desired_width(f32::INFINITY)
+                        .id_source("notes_edit");
+                    let notes_response = ui.add(notes_edit);
+                    if notes_response.changed() {
+                        issue.notes = if notes_text.is_empty() {
                             None
                         } else {
-                            Some(assignee_text)
+                            Some(notes_text)
                         };
                         self.edit_modified = true;
+                        // Request focus to prevent losing it when Save button appears
+                        notes_response.request_focus();
                     }
-                });
 
-                ui.horizontal(|ui| {
-                    ui.label("Created:");
-                    ui.label(&issue.created_at);
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Updated:");
-                    ui.label(&issue.updated_at);
-                });
-
-                ui.separator();
-                ui.label("Description:");
-                ui.label(&issue.description);
-
-                ui.separator();
-                ui.label("Notes:");
-                let mut notes_text = issue.notes.clone().unwrap_or_default();
-                let notes_edit = egui::TextEdit::multiline(&mut notes_text)
-                    .desired_width(f32::INFINITY)
-                    .id_source("notes_edit");
-                let notes_response = ui.add(notes_edit);
-                if notes_response.changed() {
-                    issue.notes = if notes_text.is_empty() {
-                        None
+                    // Always show Blockers section (issues that must be completed before this one)
+                    ui.separator();
+                    ui.label("Blockers (issues blocking this one):");
+                    if issue.dependencies.is_empty() {
+                        ui.label("  None");
                     } else {
-                        Some(notes_text)
-                    };
-                    self.edit_modified = true;
-                    // Request focus to prevent losing it when Save button appears
-                    notes_response.request_focus();
-                }
-
-                // Always show Blockers section (issues that must be completed before this one)
-                ui.separator();
-                ui.label("Blockers (issues blocking this one):");
-                if issue.dependencies.is_empty() {
-                    ui.label("  None");
-                } else {
-                    for dep in &issue.dependencies {
-                        ui.horizontal(|ui| {
-                            if ui.button(&dep.id).clicked() {
-                                // Find the index of this dependency in the issues list
-                                if let Some(dep_idx) = self.issues.iter().position(|i| i.id == dep.id) {
-                                    nav_to_issue_idx = Some(dep_idx);
-                                }
-                            }
-                            ui.label(format!("- {}", dep.title));
-                        });
-                    }
-                }
-
-                // Always show Dependents section (issues blocked by this one)
-                ui.separator();
-                ui.label("Dependents (issues blocked by this one):");
-                if let Some(dependent_ids) = self.dependents_map.get(&issue.id) {
-                    for dependent_id in dependent_ids {
-                        if let Some(dependent) = self.issues.iter().find(|i| &i.id == dependent_id) {
+                        for dep in &issue.dependencies {
                             ui.horizontal(|ui| {
-                                if ui.button(&dependent.id).clicked() {
-                                    // Find the index of this dependent in the issues list
-                                    if let Some(dep_idx) = self.issues.iter().position(|i| i.id == dependent.id) {
+                                if ui.button(&dep.id).clicked() {
+                                    // Find the index of this dependency in the issues list
+                                    if let Some(dep_idx) =
+                                        self.issues.iter().position(|i| i.id == dep.id)
+                                    {
                                         nav_to_issue_idx = Some(dep_idx);
                                     }
                                 }
-                                ui.label(format!("- {}", dependent.title));
+                                ui.label(format!("- {}", dep.title));
                             });
                         }
                     }
-                } else {
-                    ui.label("  None");
+
+                    // Always show Dependents section (issues blocked by this one)
+                    ui.separator();
+                    ui.label("Dependents (issues blocked by this one):");
+                    if let Some(dependent_ids) = self.dependents_map.get(&issue.id) {
+                        for dependent_id in dependent_ids {
+                            if let Some(dependent) =
+                                self.issues.iter().find(|i| &i.id == dependent_id)
+                            {
+                                ui.horizontal(|ui| {
+                                    if ui.button(&dependent.id).clicked() {
+                                        // Find the index of this dependent in the issues list
+                                        if let Some(dep_idx) =
+                                            self.issues.iter().position(|i| i.id == dependent.id)
+                                        {
+                                            nav_to_issue_idx = Some(dep_idx);
+                                        }
+                                    }
+                                    ui.label(format!("- {}", dependent.title));
+                                });
+                            }
+                        }
+                    } else {
+                        ui.label("  None");
+                    }
                 }
-            }
-        });
+            });
 
         // Handle actions after borrowing
         if should_refresh {
