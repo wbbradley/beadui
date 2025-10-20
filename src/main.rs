@@ -2,6 +2,8 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 use font_kit::family_name::FamilyName;
 use font_kit::properties::Properties;
@@ -25,6 +27,140 @@ struct Issue {
     dependencies: Vec<Issue>,
     #[serde(default)]
     source_directory: String,
+}
+
+// Configuration for a single monitored directory
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DirectoryConfig {
+    path: PathBuf,
+    visible: bool,
+    #[serde(default)]
+    display_name: String,
+}
+
+// Application configuration persisted to ~/.config/beadui/config.yaml
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppConfig {
+    #[serde(default)]
+    directories: Vec<DirectoryConfig>,
+    #[serde(default)]
+    sidebar_collapsed: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            directories: Vec::new(),
+            sidebar_collapsed: false,
+        }
+    }
+}
+
+impl AppConfig {
+    /// Get the path to the config file: ~/.config/beadui/config.yaml
+    fn config_path() -> Option<PathBuf> {
+        dirs::config_dir().map(|mut path| {
+            path.push("beadui");
+            path.push("config.yaml");
+            path
+        })
+    }
+
+    /// Load config from ~/.config/beadui/config.yaml
+    /// Returns default config if file doesn't exist or is corrupt
+    fn load() -> Self {
+        let config_path = match Self::config_path() {
+            Some(path) => path,
+            None => return Self::default(),
+        };
+
+        // If file doesn't exist, return default
+        if !config_path.exists() {
+            return Self::default();
+        }
+
+        // Try to read and parse the file
+        match fs::read_to_string(&config_path) {
+            Ok(contents) => {
+                match serde_yaml::from_str::<AppConfig>(&contents) {
+                    Ok(config) => config,
+                    Err(_) => {
+                        // Corrupt file - return default
+                        Self::default()
+                    }
+                }
+            }
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Save config to ~/.config/beadui/config.yaml
+    /// Creates directory if it doesn't exist
+    fn save(&self) -> Result<(), String> {
+        let config_path = Self::config_path()
+            .ok_or_else(|| "Could not determine config directory".to_string())?;
+
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create config directory: {}", e))?;
+        }
+
+        // Serialize to YAML
+        let yaml = serde_yaml::to_string(self)
+            .map_err(|e| format!("Failed to serialize config: {}", e))?;
+
+        // Write to file
+        fs::write(&config_path, yaml)
+            .map_err(|e| format!("Failed to write config file: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Abbreviate path by replacing home directory with ~
+    fn abbreviate_path(path: &PathBuf) -> String {
+        if let Some(home_dir) = dirs::home_dir() {
+            if let Ok(suffix) = path.strip_prefix(&home_dir) {
+                return format!("~/{}", suffix.display());
+            }
+        }
+        path.display().to_string()
+    }
+
+    /// Compute display names for all directories
+    /// Shows just the base name for unique names, or "base (~/path)" for duplicates
+    fn compute_display_names(&mut self) {
+        // Group directories by their base name
+        let mut base_name_groups: HashMap<String, Vec<usize>> = HashMap::new();
+
+        for (idx, dir) in self.directories.iter().enumerate() {
+            let base_name = dir.path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+
+            base_name_groups
+                .entry(base_name)
+                .or_insert_with(Vec::new)
+                .push(idx);
+        }
+
+        // Set display names based on uniqueness
+        for (base_name, indices) in base_name_groups {
+            if indices.len() == 1 {
+                // Unique name - just show base name
+                let idx = indices[0];
+                self.directories[idx].display_name = base_name;
+            } else {
+                // Duplicate names - show base name with abbreviated path
+                for idx in indices {
+                    let abbreviated = Self::abbreviate_path(&self.directories[idx].path);
+                    self.directories[idx].display_name = format!("{} ({})", base_name, abbreviated);
+                }
+            }
+        }
+    }
 }
 
 // Snapshot-based cache for BdClient results
@@ -63,10 +199,29 @@ impl SnapshotCache {
 struct BdClient;
 
 impl BdClient {
-    fn list_issues() -> Result<Vec<Issue>, String> {
-        let output = Command::new("bd")
-            .arg("list")
-            .arg("--json")
+    fn list_issues(db_path: Option<&PathBuf>, source_directory: &str) -> Result<Vec<Issue>, String> {
+        let mut cmd = Command::new("bd");
+        cmd.arg("list").arg("--json");
+
+        // Add --db flag if db_path is provided
+        if let Some(path) = db_path {
+            // Construct path to .beads/*.db file
+            let mut db_file = path.clone();
+            db_file.push(".beads");
+
+            // Find the .db file in .beads directory
+            if let Ok(entries) = fs::read_dir(&db_file) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.extension().and_then(|s| s.to_str()) == Some("db") {
+                        cmd.arg("--db").arg(&entry_path);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let output = cmd
             .output()
             .map_err(|e| format!("Failed to execute bd: {}", e))?;
 
@@ -75,7 +230,48 @@ impl BdClient {
         }
 
         let json = String::from_utf8_lossy(&output.stdout);
-        serde_json::from_str(&json).map_err(|e| format!("Failed to parse JSON: {}", e))
+        let mut issues: Vec<Issue> = serde_json::from_str(&json)
+            .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+
+        // Set source_directory on all issues
+        for issue in &mut issues {
+            issue.source_directory = source_directory.to_string();
+        }
+
+        Ok(issues)
+    }
+
+    fn list_issues_from_all(directories: &[DirectoryConfig]) -> Vec<Issue> {
+        let mut all_issues = Vec::new();
+
+        for dir_config in directories {
+            if !dir_config.visible {
+                continue;
+            }
+
+            // Use display_name as source_directory identifier
+            let source_name = if dir_config.display_name.is_empty() {
+                dir_config.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                dir_config.display_name.clone()
+            };
+
+            match Self::list_issues(Some(&dir_config.path), &source_name) {
+                Ok(mut issues) => {
+                    all_issues.append(&mut issues);
+                }
+                Err(_) => {
+                    // Silently skip directories that fail to load
+                    // Could add error tracking here if needed
+                }
+            }
+        }
+
+        all_issues
     }
 
     fn get_issue_uncached(id: &str) -> Result<Issue, String> {
@@ -360,7 +556,9 @@ impl BeadUiApp {
         // Clear the snapshot cache on refresh
         self.snapshot_cache.clear();
 
-        match BdClient::list_issues() {
+        // For now, use None for db_path to maintain current behavior (auto-discovery)
+        // This will be updated in beadui-20 to use multi-directory config
+        match BdClient::list_issues(None, "") {
             Ok(issues) => {
                 self.issues = issues;
                 self.compute_dependents_map();
@@ -695,6 +893,7 @@ impl BeadUiApp {
 
         // Pre-compute cardinalities to avoid borrow checker issues in context menus
         let id_cardinality = self.get_column_cardinality(SortColumn::Id);
+        let directory_cardinality = self.get_column_cardinality(SortColumn::Directory);
         let title_cardinality = self.get_column_cardinality(SortColumn::Title);
         let status_cardinality = self.get_column_cardinality(SortColumn::Status);
         let priority_cardinality = self.get_column_cardinality(SortColumn::Priority);
@@ -708,6 +907,7 @@ impl BeadUiApp {
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::initial(100.0).resizable(true))  // ID
+            .column(Column::initial(120.0).resizable(true))  // Directory
             .column(Column::remainder().resizable(true))      // Title
             .column(Column::initial(100.0).resizable(true))  // Status
             .column(Column::initial(70.0).resizable(true))   // Priority
@@ -719,6 +919,11 @@ impl BeadUiApp {
                 header.col(|ui| {
                     if self.sortable_header_ui(ui, "ID", SortColumn::Id, id_cardinality, filter_toggle) {
                         *new_sort_by = Some(SortColumn::Id);
+                    }
+                });
+                header.col(|ui| {
+                    if self.sortable_header_ui(ui, "Directory", SortColumn::Directory, directory_cardinality, filter_toggle) {
+                        *new_sort_by = Some(SortColumn::Directory);
                     }
                 });
                 header.col(|ui| {
@@ -797,6 +1002,57 @@ impl BeadUiApp {
                                 *new_selected = Some(Some(original_idx));
                             }
                             // No context menu for ID column (not useful for filtering)
+                        });
+
+                        // Directory column
+                        row.col(|ui| {
+                            let available_size = ui.available_size();
+                            let (id, rect) = ui.allocate_space(available_size);
+                            let response = ui.interact(rect, id, egui::Sense::click());
+
+                            if response.hovered() {
+                                any_cell_hovered = true;
+                            }
+
+                            if is_row_hovered {
+                                ui.painter().rect_filled(rect, 0.0, ui.visuals().widgets.hovered.bg_fill);
+                            }
+
+                            let mut child_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(rect)
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                            );
+                            child_ui.add(egui::Label::new(&issue.source_directory).selectable(false));
+
+                            if response.clicked() {
+                                *new_selected = Some(Some(original_idx));
+                            }
+                            if response.double_clicked() {
+                                *new_selected = Some(Some(original_idx));
+                            }
+
+                            let directory_value = issue.source_directory.clone();
+                            response.context_menu(|ui| {
+                                if directory_cardinality > 20 {
+                                    ui.label(format!("⚠ High cardinality ({} values)", directory_cardinality));
+                                    ui.label("Filtering not available");
+                                } else {
+                                    let current_filter = self.column_filters.get(&SortColumn::Directory);
+                                    let is_filtered = current_filter
+                                        .map(|f| f.is_filtered(&directory_value))
+                                        .unwrap_or(false);
+
+                                    if ui.button(if is_filtered {
+                                        format!("✓ Include \"{}\"", directory_value)
+                                    } else {
+                                        format!("✗ Exclude \"{}\"", directory_value)
+                                    }).clicked() {
+                                        *filter_toggle = Some((SortColumn::Directory, directory_value.clone()));
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
                         });
 
                         row.col(|ui| {
