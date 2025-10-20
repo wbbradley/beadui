@@ -3,6 +3,9 @@ use egui_extras::{Column, TableBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
+use font_kit::family_name::FamilyName;
+use font_kit::properties::Properties;
+use font_kit::source::SystemSource;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Issue {
@@ -20,6 +23,41 @@ struct Issue {
     updated_at: String,
     #[serde(default)]
     dependencies: Vec<Issue>,
+    #[serde(default)]
+    source_directory: String,
+}
+
+// Snapshot-based cache for BdClient results
+#[derive(Clone)]
+struct SnapshotCache {
+    get_issue_cache: HashMap<String, Issue>,
+}
+
+impl SnapshotCache {
+    fn new() -> Self {
+        Self {
+            get_issue_cache: HashMap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.get_issue_cache.clear();
+    }
+
+    fn get_issue(&mut self, id: &str) -> Result<Issue, String> {
+        // Check cache first
+        if let Some(cached_issue) = self.get_issue_cache.get(id) {
+            return Ok(cached_issue.clone());
+        }
+
+        // Cache miss - fetch from CLI
+        let issue = BdClient::get_issue_uncached(id)?;
+
+        // Store in cache
+        self.get_issue_cache.insert(id.to_string(), issue.clone());
+
+        Ok(issue)
+    }
 }
 
 struct BdClient;
@@ -40,7 +78,7 @@ impl BdClient {
         serde_json::from_str(&json).map_err(|e| format!("Failed to parse JSON: {}", e))
     }
 
-    fn get_issue(id: &str) -> Result<Issue, String> {
+    fn get_issue_uncached(id: &str) -> Result<Issue, String> {
         let output = Command::new("bd")
             .arg("show")
             .arg(id)
@@ -121,16 +159,32 @@ struct BeadUiApp {
     hovered_row: Option<usize>,
     split_ratio: f32,  // Ratio of list height to total height (0.0 to 1.0)
     column_filters: HashMap<SortColumn, ColumnFilter>,
+    // Map from issue_id -> list of issue_ids that depend on it
+    dependents_map: HashMap<String, Vec<String>>,
+    // Snapshot-based cache for BdClient calls
+    snapshot_cache: SnapshotCache,
+}
+
+// Struct to hold pre-computed display values for an issue
+struct IssueDisplay {
+    original_idx: usize,
+    issue: Issue,
+    readiness: String,
+    blockers_count: usize,
+    dependents_count: usize,
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
 enum SortColumn {
     Id,
+    Directory,
     Title,
     Status,
     Priority,
     Type,
     Assignee,
+    Blockers,
+    Dependents,
 }
 
 impl Default for BeadUiApp {
@@ -154,6 +208,8 @@ impl Default for BeadUiApp {
             hovered_row: None,
             split_ratio: 0.5,  // Start with 50/50 split
             column_filters,
+            dependents_map: HashMap::new(),
+            snapshot_cache: SnapshotCache::new(),
         };
         app.refresh();
         app
@@ -167,7 +223,97 @@ impl BeadUiApp {
         Self::default()
     }
 
+    fn load_system_fonts(cc: &eframe::CreationContext<'_>) {
+        let mut fonts = egui::FontDefinitions::default();
+
+        // Try to load system UI font
+        let system_source = SystemSource::new();
+
+        // Try to find the system UI font based on platform
+        let ui_font_result = if cfg!(target_os = "macos") {
+            // On macOS, try system UI font (which will be San Francisco on modern macOS)
+            system_source.select_best_match(
+                &[FamilyName::SansSerif],
+                &Properties::new()
+            )
+        } else if cfg!(target_os = "windows") {
+            // On Windows, try Segoe UI
+            system_source.select_best_match(
+                &[FamilyName::Title("Segoe UI".to_string())],
+                &Properties::new()
+            ).or_else(|_| {
+                system_source.select_best_match(
+                    &[FamilyName::SansSerif],
+                    &Properties::new()
+                )
+            })
+        } else {
+            // On Linux, try common UI fonts
+            system_source.select_best_match(
+                &[FamilyName::Title("Ubuntu".to_string())],
+                &Properties::new()
+            ).or_else(|_| {
+                system_source.select_best_match(
+                    &[FamilyName::Title("Cantarell".to_string())],
+                    &Properties::new()
+                )
+            }).or_else(|_| {
+                system_source.select_best_match(
+                    &[FamilyName::SansSerif],
+                    &Properties::new()
+                )
+            })
+        };
+
+        // Load the system font if found
+        if let Ok(handle) = ui_font_result {
+            if let Ok(font) = handle.load() {
+                if let Some(font_data) = font.copy_font_data() {
+                    fonts.font_data.insert(
+                        "system_ui".to_owned(),
+                        egui::FontData::from_owned(font_data.to_vec()),
+                    );
+
+                    // Set system UI font as the first proportional font
+                    fonts
+                        .families
+                        .entry(egui::FontFamily::Proportional)
+                        .or_default()
+                        .insert(0, "system_ui".to_owned());
+                }
+            }
+        }
+
+        // Load system monospace font
+        let mono_font_result = system_source.select_best_match(
+            &[FamilyName::Monospace],
+            &Properties::new()
+        );
+
+        if let Ok(handle) = mono_font_result {
+            if let Ok(font) = handle.load() {
+                if let Some(font_data) = font.copy_font_data() {
+                    fonts.font_data.insert(
+                        "system_mono".to_owned(),
+                        egui::FontData::from_owned(font_data.to_vec()),
+                    );
+
+                    fonts
+                        .families
+                        .entry(egui::FontFamily::Monospace)
+                        .or_default()
+                        .insert(0, "system_mono".to_owned());
+                }
+            }
+        }
+
+        cc.egui_ctx.set_fonts(fonts);
+    }
+
     fn setup_custom_fonts(cc: &eframe::CreationContext<'_>) {
+        // Load system fonts first
+        Self::load_system_fonts(cc);
+
         // Set up better font sizing that matches system UI conventions
         let mut style = (*cc.egui_ctx.style()).clone();
 
@@ -190,10 +336,34 @@ impl BeadUiApp {
         cc.egui_ctx.set_style(style);
     }
 
+    fn compute_dependents_map(&mut self) {
+        // Build a map of issue_id -> list of issues that depend on it
+        let mut dependents_map: HashMap<String, Vec<String>> = HashMap::new();
+
+        // We need to load full issue details to get dependencies
+        for issue in &self.issues {
+            if let Ok(full_issue) = self.snapshot_cache.get_issue(&issue.id) {
+                // For each dependency (blocker), add this issue as a dependent
+                for dep in &full_issue.dependencies {
+                    dependents_map
+                        .entry(dep.id.clone())
+                        .or_insert_with(Vec::new)
+                        .push(issue.id.clone());
+                }
+            }
+        }
+
+        self.dependents_map = dependents_map;
+    }
+
     fn refresh(&mut self) {
+        // Clear the snapshot cache on refresh
+        self.snapshot_cache.clear();
+
         match BdClient::list_issues() {
             Ok(issues) => {
                 self.issues = issues;
+                self.compute_dependents_map();
                 self.error_message = None;
             }
             Err(e) => {
@@ -202,72 +372,140 @@ impl BeadUiApp {
         }
     }
 
-    fn get_column_value(&self, issue: &Issue, column: SortColumn) -> String {
-        match column {
-            SortColumn::Id => issue.id.clone(),
-            SortColumn::Title => issue.title.clone(),
-            SortColumn::Status => issue.status.clone(),
-            SortColumn::Priority => format!("P{}", issue.priority),
-            SortColumn::Type => issue.issue_type.clone(),
-            SortColumn::Assignee => issue.assignee.clone().unwrap_or_else(|| "-".to_string()),
+    fn get_blockers_count(&mut self, issue_id: &str) -> usize {
+        // Get full issue to count active blockers (dependencies that are not closed)
+        if let Ok(full_issue) = self.snapshot_cache.get_issue(issue_id) {
+            full_issue.dependencies.iter()
+                .filter(|dep| dep.status != "closed")
+                .count()
+        } else {
+            0
         }
     }
 
-    fn get_column_cardinality(&self, column: SortColumn) -> usize {
+    fn get_dependents_count(&self, issue_id: &str) -> usize {
+        self.dependents_map.get(issue_id).map(|v| v.len()).unwrap_or(0)
+    }
+
+    fn get_readiness(&mut self, issue: &Issue) -> String {
+        // Compute readiness based on status and blockers
+        match issue.status.as_str() {
+            "closed" => "closed".to_string(),
+            "in_progress" => "in_progress".to_string(),
+            _ => {
+                // For open issues, check if they're blocked
+                let blockers_count = self.get_blockers_count(&issue.id);
+                if blockers_count > 0 {
+                    "blocked".to_string()
+                } else {
+                    "ready".to_string()
+                }
+            }
+        }
+    }
+
+    fn get_column_value(&mut self, issue: &Issue, column: SortColumn) -> String {
+        match column {
+            SortColumn::Id => issue.id.clone(),
+            SortColumn::Directory => issue.source_directory.clone(),
+            SortColumn::Title => issue.title.clone(),
+            SortColumn::Status => self.get_readiness(issue),
+            SortColumn::Priority => format!("P{}", issue.priority),
+            SortColumn::Type => issue.issue_type.clone(),
+            SortColumn::Assignee => issue.assignee.clone().unwrap_or_else(|| "-".to_string()),
+            SortColumn::Blockers => self.get_blockers_count(&issue.id).to_string(),
+            SortColumn::Dependents => self.get_dependents_count(&issue.id).to_string(),
+        }
+    }
+
+    fn get_column_cardinality(&mut self, column: SortColumn) -> usize {
         let mut unique_values = HashSet::new();
-        for issue in &self.issues {
+        for issue in &self.issues.clone() {
             unique_values.insert(self.get_column_value(issue, column));
         }
         unique_values.len()
     }
 
-    fn filtered_and_sorted_issues(&self) -> Vec<(usize, &Issue)> {
+    fn filtered_and_sorted_issues(&mut self) -> Vec<IssueDisplay> {
         let filter = self.filter_text.to_lowercase();
-        let mut filtered: Vec<(usize, &Issue)> = self
-            .issues
+
+        // Clone issues before iterating to avoid borrow checker issues
+        let issues_clone = self.issues.clone();
+
+        // Pre-compute values that require cache access and clone issues
+        let mut filtered: Vec<IssueDisplay> = issues_clone
             .iter()
             .enumerate()
-            .filter(|(_, issue)| {
-                // Apply text search filter
+            .filter_map(|(idx, issue)| {
+                // Pre-compute values needed for filtering and sorting
+                let readiness = self.get_readiness(issue);
+                let blockers_count = self.get_blockers_count(&issue.id);
+                let dependents_count = self.get_dependents_count(&issue.id);
+
+                // Apply text search filter - search through all visible fields including computed ones
                 if !filter.is_empty() {
                     let text_match = issue.id.to_lowercase().contains(&filter)
                         || issue.title.to_lowercase().contains(&filter)
                         || issue.description.to_lowercase().contains(&filter)
                         || issue.status.to_lowercase().contains(&filter)
+                        || issue.issue_type.to_lowercase().contains(&filter)
                         || issue
                             .assignee
                             .as_ref()
                             .map(|a| a.to_lowercase().contains(&filter))
-                            .unwrap_or(false);
+                            .unwrap_or(false)
+                        || readiness.to_lowercase().contains(&filter)
+                        || blockers_count.to_string().contains(&filter)
+                        || dependents_count.to_string().contains(&filter);
                     if !text_match {
-                        return false;
+                        return None;
                     }
                 }
 
                 // Apply column filters
                 for (column, column_filter) in &self.column_filters {
-                    let value = self.get_column_value(issue, *column);
+                    let value = match column {
+                        SortColumn::Id => issue.id.clone(),
+                        SortColumn::Directory => issue.source_directory.clone(),
+                        SortColumn::Title => issue.title.clone(),
+                        SortColumn::Status => readiness.clone(),
+                        SortColumn::Priority => format!("P{}", issue.priority),
+                        SortColumn::Type => issue.issue_type.clone(),
+                        SortColumn::Assignee => issue.assignee.clone().unwrap_or_else(|| "-".to_string()),
+                        SortColumn::Blockers => blockers_count.to_string(),
+                        SortColumn::Dependents => dependents_count.to_string(),
+                    };
                     if column_filter.is_filtered(&value) {
-                        return false;
+                        return None;
                     }
                 }
 
-                true
+                Some(IssueDisplay {
+                    original_idx: idx,
+                    issue: issue.clone(),
+                    readiness,
+                    blockers_count,
+                    dependents_count,
+                })
             })
             .collect();
 
-        filtered.sort_by(|(_, a), (_, b)| {
+        filtered.sort_by(|a, b| {
             let cmp = match self.sort_by {
-                SortColumn::Id => a.id.cmp(&b.id),
-                SortColumn::Title => a.title.cmp(&b.title),
-                SortColumn::Status => a.status.cmp(&b.status),
-                SortColumn::Priority => a.priority.cmp(&b.priority),
-                SortColumn::Type => a.issue_type.cmp(&b.issue_type),
+                SortColumn::Id => a.issue.id.cmp(&b.issue.id),
+                SortColumn::Directory => a.issue.source_directory.cmp(&b.issue.source_directory),
+                SortColumn::Title => a.issue.title.cmp(&b.issue.title),
+                SortColumn::Status => a.readiness.cmp(&b.readiness),
+                SortColumn::Priority => a.issue.priority.cmp(&b.issue.priority),
+                SortColumn::Type => a.issue.issue_type.cmp(&b.issue.issue_type),
                 SortColumn::Assignee => a
+                    .issue
                     .assignee
                     .as_ref()
                     .unwrap_or(&String::new())
-                    .cmp(b.assignee.as_ref().unwrap_or(&String::new())),
+                    .cmp(b.issue.assignee.as_ref().unwrap_or(&String::new())),
+                SortColumn::Blockers => a.blockers_count.cmp(&b.blockers_count),
+                SortColumn::Dependents => a.dependents_count.cmp(&b.dependents_count),
             };
             if self.sort_ascending {
                 cmp
@@ -288,11 +526,12 @@ impl BeadUiApp {
                 if ui.button("Refresh").clicked() {
                     self.refresh();
                 }
-            });
 
-            ui.horizontal(|ui| {
-                ui.label("Filter:");
-                ui.text_edit_singleline(&mut self.filter_text);
+                // Add filter on the right side of the same line
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.text_edit_singleline(&mut self.filter_text);
+                    ui.label("Filter:");
+                });
             });
 
             if let Some(ref error) = self.error_message {
@@ -445,7 +684,7 @@ impl BeadUiApp {
     }
 
     fn show_list_table(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         new_sort_by: &mut Option<SortColumn>,
         new_selected: &mut Option<Option<usize>>,
@@ -461,6 +700,8 @@ impl BeadUiApp {
         let priority_cardinality = self.get_column_cardinality(SortColumn::Priority);
         let type_cardinality = self.get_column_cardinality(SortColumn::Type);
         let assignee_cardinality = self.get_column_cardinality(SortColumn::Assignee);
+        let blockers_cardinality = self.get_column_cardinality(SortColumn::Blockers);
+        let dependents_cardinality = self.get_column_cardinality(SortColumn::Dependents);
 
         TableBuilder::new(ui)
             .striped(true)
@@ -472,6 +713,8 @@ impl BeadUiApp {
             .column(Column::initial(70.0).resizable(true))   // Priority
             .column(Column::initial(100.0).resizable(true))  // Type
             .column(Column::initial(120.0).resizable(true))  // Assignee
+            .column(Column::initial(80.0).resizable(true))   // Blockers
+            .column(Column::initial(80.0).resizable(true))   // Dependents
             .header(25.0, |mut header| {
                 header.col(|ui| {
                     if self.sortable_header_ui(ui, "ID", SortColumn::Id, id_cardinality, filter_toggle) {
@@ -503,13 +746,25 @@ impl BeadUiApp {
                         *new_sort_by = Some(SortColumn::Assignee);
                     }
                 });
+                header.col(|ui| {
+                    if self.sortable_header_ui(ui, "Blockers", SortColumn::Blockers, blockers_cardinality, filter_toggle) {
+                        *new_sort_by = Some(SortColumn::Blockers);
+                    }
+                });
+                header.col(|ui| {
+                    if self.sortable_header_ui(ui, "Dependents", SortColumn::Dependents, dependents_cardinality, filter_toggle) {
+                        *new_sort_by = Some(SortColumn::Dependents);
+                    }
+                });
             })
             .body(|body| {
                 body.rows(20.0, filtered.len(), |mut row| {
                     let row_index = row.index();
-                    if let Some((original_idx, issue)) = filtered.get(row_index) {
-                        let is_selected = self.selected_index == Some(*original_idx);
-                        let is_row_hovered = self.hovered_row == Some(*original_idx);
+                    if let Some(display) = filtered.get(row_index) {
+                        let original_idx = display.original_idx;
+                        let issue = &display.issue;
+                        let is_selected = self.selected_index == Some(original_idx);
+                        let is_row_hovered = self.hovered_row == Some(original_idx);
 
                         row.set_selected(is_selected);
 
@@ -536,10 +791,10 @@ impl BeadUiApp {
                             child_ui.add(egui::Label::new(&issue.id).selectable(false));
 
                             if response.clicked() {
-                                *new_selected = Some(Some(*original_idx));
+                                *new_selected = Some(Some(original_idx));
                             }
                             if response.double_clicked() {
-                                *new_selected = Some(Some(*original_idx));
+                                *new_selected = Some(Some(original_idx));
                             }
                             // No context menu for ID column (not useful for filtering)
                         });
@@ -565,10 +820,10 @@ impl BeadUiApp {
                             child_ui.add(egui::Label::new(&issue.title).selectable(false));
 
                             if response.clicked() {
-                                *new_selected = Some(Some(*original_idx));
+                                *new_selected = Some(Some(original_idx));
                             }
                             if response.double_clicked() {
-                                *new_selected = Some(Some(*original_idx));
+                                *new_selected = Some(Some(original_idx));
                             }
                             // No context menu for Title column (not useful for filtering)
                         });
@@ -591,15 +846,17 @@ impl BeadUiApp {
                                     .max_rect(rect)
                                     .layout(egui::Layout::left_to_right(egui::Align::Center))
                             );
-                            child_ui.add(egui::Label::new(&issue.status).selectable(false));
+                            let status_text = &display.readiness;
+                            child_ui.add(egui::Label::new(status_text).selectable(false));
 
                             if response.clicked() {
-                                *new_selected = Some(Some(*original_idx));
+                                *new_selected = Some(Some(original_idx));
                             }
                             if response.double_clicked() {
-                                *new_selected = Some(Some(*original_idx));
+                                *new_selected = Some(Some(original_idx));
                             }
 
+                            let status_value = status_text.clone();
                             response.context_menu(|ui| {
                                 if status_cardinality > 20 {
                                     ui.label(format!("⚠ High cardinality ({} values)", status_cardinality));
@@ -607,15 +864,15 @@ impl BeadUiApp {
                                 } else {
                                     let current_filter = self.column_filters.get(&SortColumn::Status);
                                     let is_filtered = current_filter
-                                        .map(|f| f.is_filtered(&issue.status))
+                                        .map(|f| f.is_filtered(&status_value))
                                         .unwrap_or(false);
 
                                     if ui.button(if is_filtered {
-                                        format!("✓ Include \"{}\"", issue.status)
+                                        format!("✓ Include \"{}\"", status_value)
                                     } else {
-                                        format!("✗ Exclude \"{}\"", issue.status)
+                                        format!("✗ Exclude \"{}\"", status_value)
                                     }).clicked() {
-                                        *filter_toggle = Some((SortColumn::Status, issue.status.clone()));
+                                        *filter_toggle = Some((SortColumn::Status, status_value.clone()));
                                         ui.close_menu();
                                     }
                                 }
@@ -644,10 +901,10 @@ impl BeadUiApp {
                             child_ui.add(egui::Label::new(&priority_text).selectable(false));
 
                             if response.clicked() {
-                                *new_selected = Some(Some(*original_idx));
+                                *new_selected = Some(Some(original_idx));
                             }
                             if response.double_clicked() {
-                                *new_selected = Some(Some(*original_idx));
+                                *new_selected = Some(Some(original_idx));
                             }
 
                             let priority_value = priority_text.clone();
@@ -694,10 +951,10 @@ impl BeadUiApp {
                             child_ui.add(egui::Label::new(&issue.issue_type).selectable(false));
 
                             if response.clicked() {
-                                *new_selected = Some(Some(*original_idx));
+                                *new_selected = Some(Some(original_idx));
                             }
                             if response.double_clicked() {
-                                *new_selected = Some(Some(*original_idx));
+                                *new_selected = Some(Some(original_idx));
                             }
 
                             let type_value = issue.issue_type.clone();
@@ -745,10 +1002,10 @@ impl BeadUiApp {
                             child_ui.add(egui::Label::new(&assignee_text).selectable(false));
 
                             if response.clicked() {
-                                *new_selected = Some(Some(*original_idx));
+                                *new_selected = Some(Some(original_idx));
                             }
                             if response.double_clicked() {
-                                *new_selected = Some(Some(*original_idx));
+                                *new_selected = Some(Some(original_idx));
                             }
 
                             let assignee_value = assignee_text.clone();
@@ -774,8 +1031,68 @@ impl BeadUiApp {
                             });
                         });
 
+                        // Blockers column
+                        row.col(|ui| {
+                            let available_size = ui.available_size();
+                            let (id, rect) = ui.allocate_space(available_size);
+                            let response = ui.interact(rect, id, egui::Sense::click());
+
+                            if response.hovered() {
+                                any_cell_hovered = true;
+                            }
+
+                            if is_row_hovered {
+                                ui.painter().rect_filled(rect, 0.0, ui.visuals().widgets.hovered.bg_fill);
+                            }
+
+                            let mut child_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(rect)
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                            );
+                            let blockers_count = display.blockers_count;
+                            child_ui.add(egui::Label::new(blockers_count.to_string()).selectable(false));
+
+                            if response.clicked() {
+                                *new_selected = Some(Some(original_idx));
+                            }
+                            if response.double_clicked() {
+                                *new_selected = Some(Some(original_idx));
+                            }
+                        });
+
+                        // Dependents column
+                        row.col(|ui| {
+                            let available_size = ui.available_size();
+                            let (id, rect) = ui.allocate_space(available_size);
+                            let response = ui.interact(rect, id, egui::Sense::click());
+
+                            if response.hovered() {
+                                any_cell_hovered = true;
+                            }
+
+                            if is_row_hovered {
+                                ui.painter().rect_filled(rect, 0.0, ui.visuals().widgets.hovered.bg_fill);
+                            }
+
+                            let mut child_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(rect)
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                            );
+                            let dependents_count = display.dependents_count;
+                            child_ui.add(egui::Label::new(dependents_count.to_string()).selectable(false));
+
+                            if response.clicked() {
+                                *new_selected = Some(Some(original_idx));
+                            }
+                            if response.double_clicked() {
+                                *new_selected = Some(Some(original_idx));
+                            }
+                        });
+
                         if any_cell_hovered {
-                            *new_hovered_row = Some(Some(*original_idx));
+                            *new_hovered_row = Some(Some(original_idx));
                         }
                     }
                 });
@@ -783,7 +1100,7 @@ impl BeadUiApp {
     }
 
     fn sortable_header_ui(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         label: &str,
         column: SortColumn,
@@ -795,7 +1112,7 @@ impl BeadUiApp {
         // Add filter indicator if column has active filters
         if let Some(filter) = self.column_filters.get(&column) {
             if filter.has_active_filters() {
-                text = format!("{} 🔽", text);
+                text = format!("{} •", text);
             }
         }
 
@@ -812,6 +1129,26 @@ impl BeadUiApp {
 
         // Add context menu to header for filter management
         if !skip_filter_menu {
+            // Pre-compute values outside the closure to avoid borrow issues
+            let values: Vec<String> = if cardinality <= 20 {
+                let issues_clone = self.issues.clone();
+                let mut vals: Vec<String> = issues_clone
+                    .iter()
+                    .map(|issue| self.get_column_value(issue, column))
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                vals.sort();
+                vals
+            } else {
+                Vec::new()
+            };
+
+            let current_filter_excluded = self.column_filters.get(&column)
+                .map(|f| f.excluded_values.clone())
+                .unwrap_or_default();
+            let has_active_filters = !current_filter_excluded.is_empty();
+
             button_response.context_menu(|ui| {
                 ui.label(format!("{} Column Filters", label));
                 ui.separator();
@@ -820,48 +1157,31 @@ impl BeadUiApp {
                     ui.label(format!("⚠ High cardinality ({} values)", cardinality));
                     ui.label("Filtering not available");
                 } else {
-                // Get all unique values for this column
-                let mut values: Vec<String> = self
-                    .issues
-                    .iter()
-                    .map(|issue| self.get_column_value(issue, column))
-                    .collect::<std::collections::HashSet<_>>()
-                    .into_iter()
-                    .collect();
-                values.sort();
+                    for value in &values {
+                        let is_filtered = current_filter_excluded.contains(value);
 
-                let current_filter = self.column_filters.get(&column);
-
-                for value in values {
-                    let is_filtered = current_filter
-                        .map(|f| f.is_filtered(&value))
-                        .unwrap_or(false);
-
-                    if ui
-                        .button(if is_filtered {
-                            format!("☐ {}", value)
-                        } else {
-                            format!("☑ {}", value)
-                        })
-                        .clicked()
-                    {
-                        *filter_toggle = Some((column, value.clone()));
+                        if ui
+                            .button(if is_filtered {
+                                format!("☐ {}", value)
+                            } else {
+                                format!("☑ {}", value)
+                            })
+                            .clicked()
+                        {
+                            *filter_toggle = Some((column, value.clone()));
+                        }
                     }
-                }
 
-                // Add "Clear all filters" option if there are active filters
-                if let Some(filter) = current_filter {
-                    if filter.has_active_filters() {
+                    // Add "Clear all filters" option if there are active filters
+                    if has_active_filters {
                         ui.separator();
                         if ui.button("Clear all filters").clicked() {
-                            // Toggle each filtered value to clear them
-                            for excluded_value in &filter.excluded_values {
+                            // Toggle the first filtered value to clear it
+                            if let Some(excluded_value) = current_filter_excluded.iter().next() {
                                 *filter_toggle = Some((column, excluded_value.clone()));
-                                break; // Only do one at a time, user can click multiple times
                             }
                         }
                     }
-                }
                 }
             });
         }
@@ -872,7 +1192,7 @@ impl BeadUiApp {
     fn show_detail_view_split(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui, issue_id: &str) {
         // Load issue if not already loaded or if different issue
         if self.current_issue.is_none() || self.current_issue.as_ref().map(|i| &i.id) != Some(&issue_id.to_string()) {
-            match BdClient::get_issue(issue_id) {
+            match self.snapshot_cache.get_issue(issue_id) {
                 Ok(issue) => {
                     self.current_issue = Some(issue);
                     self.edit_modified = false;
@@ -1013,9 +1333,12 @@ impl BeadUiApp {
                     notes_response.request_focus();
                 }
 
-                if !issue.dependencies.is_empty() {
-                    ui.separator();
-                    ui.label("Dependencies (Blocks this issue):");
+                // Always show Blockers section (issues that must be completed before this one)
+                ui.separator();
+                ui.label("Blockers (issues blocking this one):");
+                if issue.dependencies.is_empty() {
+                    ui.label("  None");
+                } else {
                     for dep in &issue.dependencies {
                         ui.horizontal(|ui| {
                             if ui.button(&dep.id).clicked() {
@@ -1027,6 +1350,27 @@ impl BeadUiApp {
                             ui.label(format!("- {}", dep.title));
                         });
                     }
+                }
+
+                // Always show Dependents section (issues blocked by this one)
+                ui.separator();
+                ui.label("Dependents (issues blocked by this one):");
+                if let Some(dependent_ids) = self.dependents_map.get(&issue.id) {
+                    for dependent_id in dependent_ids {
+                        if let Some(dependent) = self.issues.iter().find(|i| &i.id == dependent_id) {
+                            ui.horizontal(|ui| {
+                                if ui.button(&dependent.id).clicked() {
+                                    // Find the index of this dependent in the issues list
+                                    if let Some(dep_idx) = self.issues.iter().position(|i| i.id == dependent.id) {
+                                        nav_to_issue_idx = Some(dep_idx);
+                                    }
+                                }
+                                ui.label(format!("- {}", dependent.title));
+                            });
+                        }
+                    }
+                } else {
+                    ui.label("  None");
                 }
             }
         });
