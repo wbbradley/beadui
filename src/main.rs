@@ -329,6 +329,64 @@ impl BdClient {
 
         Ok(())
     }
+
+    fn create_issue(
+        title: &str,
+        description: &str,
+        issue_type: &str,
+        priority: i32,
+        assignee: Option<&str>,
+        db_path: Option<&PathBuf>,
+    ) -> Result<(), String> {
+        let mut cmd = Command::new("bd");
+        cmd.arg("create").arg(title);
+
+        // Add description if not empty
+        if !description.is_empty() {
+            cmd.arg("-d").arg(description);
+        }
+
+        // Add type
+        cmd.arg("-t").arg(issue_type);
+
+        // Add priority
+        cmd.arg("-p").arg(priority.to_string());
+
+        // Add assignee if provided
+        if let Some(assignee_val) = assignee {
+            if !assignee_val.is_empty() {
+                cmd.arg("--assignee").arg(assignee_val);
+            }
+        }
+
+        // Add --db flag if db_path is provided
+        if let Some(path) = db_path {
+            // Construct path to .beads/*.db file
+            let mut db_file = path.clone();
+            db_file.push(".beads");
+
+            // Find the .db file in .beads directory
+            if let Ok(entries) = fs::read_dir(&db_file) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.extension().and_then(|s| s.to_str()) == Some("db") {
+                        cmd.arg("--db").arg(&entry_path);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let output = cmd
+            .output()
+            .map_err(|e| format!("Failed to execute bd: {}", e))?;
+
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).to_string());
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -379,6 +437,13 @@ struct BeadUiApp {
     snapshot_cache: SnapshotCache,
     // Application configuration
     config: AppConfig,
+    // Create issue dialog state
+    show_create_dialog: bool,
+    create_title: String,
+    create_description: String,
+    create_type: String,
+    create_priority: i32,
+    create_assignee: String,
 }
 
 // Struct to hold pre-computed display values for an issue
@@ -450,6 +515,12 @@ impl Default for BeadUiApp {
             dependents_map: HashMap::new(),
             snapshot_cache: SnapshotCache::new(),
             config,
+            show_create_dialog: false,
+            create_title: String::new(),
+            create_description: String::new(),
+            create_type: "task".to_string(),
+            create_priority: 2,
+            create_assignee: String::new(),
         };
         app.refresh();
         app
@@ -895,6 +966,10 @@ impl BeadUiApp {
                 if ui.button("Refresh").clicked() {
                     self.refresh();
                 }
+                ui.separator();
+                if ui.button("+ Create Issue").clicked() {
+                    self.show_create_dialog = true;
+                }
 
                 // Add filter on the right side of the same line
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1239,6 +1314,7 @@ impl BeadUiApp {
                                     .max_rect(rect)
                                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
+                            child_ui.set_clip_rect(rect);
                             child_ui.add(egui::Label::new(&issue.id).selectable(false));
 
                             if response.clicked() {
@@ -1273,6 +1349,7 @@ impl BeadUiApp {
                                     .max_rect(rect)
                                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
+                            child_ui.set_clip_rect(rect);
                             child_ui
                                 .add(egui::Label::new(&issue.source_directory).selectable(false));
 
@@ -1336,6 +1413,7 @@ impl BeadUiApp {
                                     .max_rect(rect)
                                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
+                            child_ui.set_clip_rect(rect);
                             child_ui.add(egui::Label::new(&issue.title).selectable(false));
 
                             if response.clicked() {
@@ -1369,6 +1447,7 @@ impl BeadUiApp {
                                     .max_rect(rect)
                                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
+                            child_ui.set_clip_rect(rect);
                             let status_text = &display.readiness;
                             child_ui.add(egui::Label::new(status_text).selectable(false));
 
@@ -1432,6 +1511,7 @@ impl BeadUiApp {
                                     .max_rect(rect)
                                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
+                            child_ui.set_clip_rect(rect);
                             let priority_text = format!("P{}", issue.priority);
                             child_ui.add(egui::Label::new(&priority_text).selectable(false));
 
@@ -1495,6 +1575,7 @@ impl BeadUiApp {
                                     .max_rect(rect)
                                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
+                            child_ui.set_clip_rect(rect);
                             child_ui.add(egui::Label::new(&issue.issue_type).selectable(false));
 
                             if response.clicked() {
@@ -1556,6 +1637,7 @@ impl BeadUiApp {
                                     .max_rect(rect)
                                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
+                            child_ui.set_clip_rect(rect);
                             let assignee_text =
                                 issue.assignee.as_ref().unwrap_or(&"-".to_string()).clone();
                             child_ui.add(egui::Label::new(&assignee_text).selectable(false));
@@ -1621,6 +1703,7 @@ impl BeadUiApp {
                                     .max_rect(rect)
                                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
+                            child_ui.set_clip_rect(rect);
                             let blockers_count = display.blockers_count;
                             child_ui.add(
                                 egui::Label::new(blockers_count.to_string()).selectable(false),
@@ -1657,6 +1740,7 @@ impl BeadUiApp {
                                     .max_rect(rect)
                                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
                             );
+                            child_ui.set_clip_rect(rect);
                             let dependents_count = display.dependents_count;
                             child_ui.add(
                                 egui::Label::new(dependents_count.to_string()).selectable(false),
@@ -2036,11 +2120,149 @@ impl BeadUiApp {
             self.error_message = Some(format!("Failed to save: {}", errors.join(", ")));
         }
     }
+
+    fn show_create_dialog(&mut self, ctx: &egui::Context) {
+        let mut should_close = false;
+        let mut should_create = false;
+
+        egui::Window::new("Create New Issue")
+            .open(&mut self.show_create_dialog)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(500.0)
+            .show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Title:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.create_title)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Description:");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.create_description)
+                                .desired_rows(4)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Type:");
+                        egui::ComboBox::from_id_salt("create_type_combo")
+                            .selected_text(&self.create_type)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.create_type, "task".to_string(), "task");
+                                ui.selectable_value(
+                                    &mut self.create_type,
+                                    "feature".to_string(),
+                                    "feature",
+                                );
+                                ui.selectable_value(&mut self.create_type, "bug".to_string(), "bug");
+                                ui.selectable_value(&mut self.create_type, "epic".to_string(), "epic");
+                            });
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Priority:");
+                        egui::ComboBox::from_id_salt("create_priority_combo")
+                            .selected_text(format!("P{}", self.create_priority))
+                            .show_ui(ui, |ui| {
+                                for p in 0..=4 {
+                                    ui.selectable_value(&mut self.create_priority, p, format!("P{}", p));
+                                }
+                            });
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Assignee:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.create_assignee)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Create").clicked() {
+                            should_create = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            should_close = true;
+                        }
+                    });
+                });
+            });
+
+        // Handle actions after dialog closes
+        if should_create {
+            if self.create_title.is_empty() {
+                self.error_message = Some("Title is required".to_string());
+            } else {
+                // Get the db_path for the first visible directory
+                let db_path = self
+                    .config
+                    .directories
+                    .iter()
+                    .find(|d| d.visible)
+                    .map(|d| d.path.clone());
+
+                let assignee = if self.create_assignee.is_empty() {
+                    None
+                } else {
+                    Some(self.create_assignee.as_str())
+                };
+
+                match BdClient::create_issue(
+                    &self.create_title,
+                    &self.create_description,
+                    &self.create_type,
+                    self.create_priority,
+                    assignee,
+                    db_path.as_ref(),
+                ) {
+                    Ok(_) => {
+                        // Clear the form
+                        self.create_title.clear();
+                        self.create_description.clear();
+                        self.create_type = "task".to_string();
+                        self.create_priority = 2;
+                        self.create_assignee.clear();
+                        self.show_create_dialog = false;
+                        self.error_message = None;
+                        // Refresh the list
+                        self.refresh();
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Failed to create issue: {}", e));
+                    }
+                }
+            }
+        }
+
+        if should_close {
+            self.show_create_dialog = false;
+            // Clear the form when canceling
+            self.create_title.clear();
+            self.create_description.clear();
+            self.create_type = "task".to_string();
+            self.create_priority = 2;
+            self.create_assignee.clear();
+        }
+    }
 }
 
 impl eframe::App for BeadUiApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.show_list_view(ctx, frame);
+
+        // Show create dialog if enabled
+        if self.show_create_dialog {
+            self.show_create_dialog(ctx);
+        }
     }
 }
 
