@@ -350,13 +350,33 @@ impl BdClient {
         Ok(())
     }
 
-    fn add_dependency(blocked_issue_id: &str, blocker_issue_id: &str) -> Result<(), String> {
+    fn add_dependency(blocked_issue_id: &str, blocker_issue_id: &str, db_path: Option<&PathBuf>) -> Result<(), String> {
         // bd dep add <blocked> <blocker>
-        let output = Command::new("bd")
-            .arg("dep")
+        let mut cmd = Command::new("bd");
+        cmd.arg("dep")
             .arg("add")
             .arg(blocked_issue_id)
-            .arg(blocker_issue_id)
+            .arg(blocker_issue_id);
+
+        // Add --db flag if db_path is provided
+        if let Some(path) = db_path {
+            // Construct path to .beads/*.db file
+            let mut db_file = path.clone();
+            db_file.push(".beads");
+
+            // Find the .db file in .beads directory
+            if let Ok(entries) = fs::read_dir(&db_file) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.extension().and_then(|s| s.to_str()) == Some("db") {
+                        cmd.arg("--db").arg(&entry_path);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let output = cmd
             .output()
             .map_err(|e| format!("Failed to execute bd: {}", e))?;
 
@@ -367,13 +387,33 @@ impl BdClient {
         Ok(())
     }
 
-    fn remove_dependency(blocked_issue_id: &str, blocker_issue_id: &str) -> Result<(), String> {
+    fn remove_dependency(blocked_issue_id: &str, blocker_issue_id: &str, db_path: Option<&PathBuf>) -> Result<(), String> {
         // bd dep remove <blocked> <blocker>
-        let output = Command::new("bd")
-            .arg("dep")
+        let mut cmd = Command::new("bd");
+        cmd.arg("dep")
             .arg("remove")
             .arg(blocked_issue_id)
-            .arg(blocker_issue_id)
+            .arg(blocker_issue_id);
+
+        // Add --db flag if db_path is provided
+        if let Some(path) = db_path {
+            // Construct path to .beads/*.db file
+            let mut db_file = path.clone();
+            db_file.push(".beads");
+
+            // Find the .db file in .beads directory
+            if let Ok(entries) = fs::read_dir(&db_file) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    if entry_path.extension().and_then(|s| s.to_str()) == Some("db") {
+                        cmd.arg("--db").arg(&entry_path);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let output = cmd
             .output()
             .map_err(|e| format!("Failed to execute bd: {}", e))?;
 
@@ -2382,7 +2422,14 @@ impl BeadUiApp {
         // Handle blocker addition
         if let Some(blocker_id) = blocker_to_add {
             if let Some(issue) = &self.current_issue {
-                match BdClient::add_dependency(&issue.id, &blocker_id) {
+                // Look up the db_path for this issue from the snapshot cache
+                let db_path = self
+                    .snapshot_cache
+                    .issue_sources
+                    .get(&issue.id)
+                    .and_then(|(_, path)| path.clone());
+
+                match BdClient::add_dependency(&issue.id, &blocker_id, db_path.as_ref()) {
                     Ok(_) => {
                         // Refresh the current issue and the list
                         self.current_issue = None;
@@ -2668,8 +2715,15 @@ impl eframe::App for BeadUiApp {
                 });
 
             if confirmed {
+                // Look up the db_path for this issue from the snapshot cache
+                let db_path = self
+                    .snapshot_cache
+                    .issue_sources
+                    .get(issue_id)
+                    .and_then(|(_, path)| path.clone());
+
                 // Remove the blocker
-                match BdClient::remove_dependency(issue_id, blocker_id) {
+                match BdClient::remove_dependency(issue_id, blocker_id, db_path.as_ref()) {
                     Ok(_) => {
                         // Refresh the current issue and the list
                         self.current_issue = None;
